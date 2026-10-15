@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.tlog
+*.tlog.raw
+*.parm
+tracker/build/
+tracker/third_party/mavlink/

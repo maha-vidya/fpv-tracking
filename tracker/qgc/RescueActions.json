@@ -1,0 +1,52 @@
+{
+    "version": 1,
+    "fileType": "MavlinkActions",
+    "actions": [
+        {
+            "label": "Track LOCK",
+            "description": "Lock the target: the detector's relock candidate if one is shown, otherwise the centre of the image (point the camera at it first)",
+            "mavCmd": 31014,
+            "compId": 191
+        },
+        {
+            "label": "GO (default)",
+            "description": "1st press arms the GO (shows distance/ETA), 2nd press within 3 s confirms it. Uses the tracker's --rescue-speed and --rescue-standoff (default: to the target)",
+            "mavCmd": 31010,
+            "compId": 191
+        },
+        {
+            "label": "GO 5 m/s, stop 3 m short",
+            "description": "GO at 5 m/s, stopping 3 m before the target. Press twice (arm + confirm).",
+            "mavCmd": 31010,
+            "compId": 191,
+            "param1": 5,
+            "param2": 3
+        },
+        {
+            "label": "GO fast 8 m/s, at target",
+            "description": "GO at 8 m/s to the target (param1 = speed m/s, param2 = stop distance m; 0 = configured). Press twice (arm + confirm).",
+            "mavCmd": 31010,
+            "compId": 191,
+            "param1": 8,
+            "param2": 0
+        },
+        {
+            "label": "ABORT (climb away)",
+            "description": "Leave the target and climb (--abort-climb, default 10 m), then hold in GUIDED",
+            "mavCmd": 31011,
+            "compId": 191
+        },
+        {
+            "label": "Track UNLOCK",
+            "description": "Drop the target lock and stop following",
+            "mavCmd": 31012,
+            "compId": 191
+        },
+        {
+            "label": "BRAKE",
+            "description": "Panic button: stop the companion's go-to and switch the vehicle to BRAKE",
+            "mavCmd": 31013,
+            "compId": 191
+        }
+    ]
+}
