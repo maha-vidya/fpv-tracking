@@ -98,7 +98,7 @@ text commands instead (one per line, `Enter` to send):
 |---|---|
 | `lock X Y W H` | lock a box at pixel (X,Y) size (W,H) — e.g. `lock 290 362 60 70` |
 | `unlock` | release the lock |
-| `go` | first press = **arm** the rescue (needs LOCKED ≥2s); second press within 3s = **confirm** and send the go-to |
+| `go` | **GO now**, one press (needs LOCKED ≥2s and every readiness gate). `--go-confirm`: first press arms, second within 3s confirms |
 | `abort` | abort an ARMED rescue, or cancel+BRAKE an in-flight dash |
 | `quit` | clean shutdown |
 
@@ -151,9 +151,9 @@ altitude, not on top of it.
 
 ### Prediction, GO guidance and identity (2026-10-14)
 - **Image motion filter: IMM.** Two Kalman filters run together: calm, and manoeuvring (turning, braking, reversing, speeding
-  up). They are blended by how well each predicted each box. `KF_NO_IMM=1` switches back to the single filter.
+  up). They are blended by how well each predicted each box.
 - **Ground track: IMM-UKF.** A straight-motion model plus a coordinated-turn model (unscented). Predicting where a turning
-  vehicle will be in 1 s: 1.5 m error instead of 6.4 m (self-test). `EST_OLD=1` switches back to the old filter.
+  vehicle will be in 1 s: 1.5 m error instead of 6.4 m (self-test).
 - **GO guidance** (`--go-guidance pursuit|lead|intercept|pn`, default `pn`, `--pn-gain 3`). The old law (`pursuit`) braked as if
   the target stood still, and never reached a target crossing at 5 m/s (simulated). The new modes match the target's motion and
   close on it relative to it: about 5.5 s from 40 m on a crossing or turning target.
@@ -172,7 +172,6 @@ altitude, not on top of it.
   view is too shallow for an angle-based fix.
 - **Filter limit for each new box:** the jump from the prediction must lie within the larger of 4 standard deviations of
   the filter's uncertainty and 0.8 box + 2.5× the target's speed per frame, against CSRT hopping onto a neighbour.
-  `KF_NO_GATE=1` turns it off.
 - **Late clicks fixed:** a click or tap is locked on the frame the operator actually saw, with the last 0.6 s of full-size
   frames kept for this, and the result is replayed to the live frame. A click made while the previous one is still being
   processed is queued (the newest one wins), not dropped. An unlock cancels pending clicks and completions.
@@ -277,8 +276,8 @@ to `127.0.0.1:14550`, and the companion's camera component listens for QGC's cam
    the on-screen `t=...` timestamp against the wall clock at the moment of a tap, and adjust).
 4. **Rescue control from QGC**: copy `tracker/qgc/RescueActions.json` into QGC's `MavlinkActions` folder
    (Linux: `~/Documents/QGroundControl/MavlinkActions`) and restart QGC. It adds **Rescue GO**
-   (`MAV_CMD_USER_1`: 1st press arms and shows `ARMED <dist> up/dn<h> ETA<s> h:<height source>`, 2nd press
-   within 3 s confirms), **Rescue ABORT** (`USER_2`), **Track UNLOCK** (`USER_3`) and **BRAKE** (`USER_4`, works
+   (`MAV_CMD_USER_1`: one press = GO; with `--go-confirm` the 1st press arms and shows
+   `ARMED <dist> up/dn<h> ETA<s> h:<height source>`, the 2nd within 3 s confirms), **Rescue ABORT** (`USER_2`), **Track UNLOCK** (`USER_3`) and **BRAKE** (`USER_4`, works
    even if the rescue isn't armed), all sent to component **191**; the same actions can be mapped to joystick
    buttons. Only commands from `--gcs-sysid` (default 255, QGC's own id) are accepted. The file format is
    QGC's documented `MavlinkActions` format, but it has **not** been clicked through in a real QGC window yet.
@@ -290,9 +289,9 @@ to `127.0.0.1:14550`, and the companion's camera component listens for QGC's cam
 
 | What | How in QGC |
 |---|---|
-| **Lock** | Point the camera at the target (sticks/gimbal), press the **Track LOCK** action (`MAV_CMD_USER_5`): it locks the detector's relock candidate if one is shown, else the centre of the image, refined to the object (detector snap, else GrabCut, then the segmenter if running). Or tap/draw on the video if your QGC build shows the camera-tracking controls. |
+| **Lock** | Point the camera at the target (sticks/gimbal), press the **Track LOCK** action (`MAV_CMD_USER_5`): it locks the object at the centre of the image (ground-colour model, else GrabCut; snapped to the one nearest object if the centre misses). Or tap/draw on the video if your QGC build shows the camera-tracking controls. |
 | **Unlock** | **Track UNLOCK** action, or stop tracking in the video widget. |
-| **GO** | **Rescue GO** twice: the first press arms and shows `ARMED <dist> up/dn<h> ETA<s> h:<height>` *and* a **`DEST ?`** marker on the map; the second press (within 3 s) confirms. |
+| **GO** | **Rescue GO** once: GO at once. With `--go-confirm`, twice: the first press arms and shows `ARMED <dist> up/dn<h> ETA<s> h:<height>` *and* a **`DEST ?`** marker on the map; the second press (within 3 s) confirms. |
 | **Abort / panic** | **Rescue ABORT**, or **BRAKE**. |
 | **See the target** | The map shows a **`TARGET`** icon at the estimated ground position (with its heading and speed once moving), relabelled `TGT ?` while coasting, `TGT LOST` / `TGT OFF` after a loss/unlock, and a **`DEST`** icon for an active dash. |
 
@@ -307,7 +306,7 @@ Verified in SITL: the marker reaches QGC's port and lands within ~1 m of the tar
 an icon 120 s after its last update (no explicit delete exists), which is why the final label says `OFF`.
 `--no-map-marker` turns them off.
 
-### How the lock box is found (no detector, no segmentation model)
+### How the lock box is found
 
 A rough selection (click, tap, centre LOCK, RC centre-lock) becomes a box in two steps, both in the tracker itself:
 1. **Ground-colour model** (~15 ms): the colours around the click are learned as "ground"; the object is what differs from them.
@@ -315,8 +314,7 @@ A rough selection (click, tap, centre LOCK, RC centre-lock) becomes a box in two
 2. In the background (~0.2 s later), **GrabCut completion** grows the box to the whole object (a truck's cab + cargo, a bus, a van
    seen from close up), with shadows trimmed and growth capped so a neighbouring object is not swallowed.
 
-A carefully drawn rectangle is tightened by GrabCut. (The YOLO / FastSAM / MobileSAM / EdgeSAM options were removed on
-2026-10-15: they were never used, and a class-based detector goes against the project's "any object, no classes" rule.)
+A carefully drawn rectangle is tightened by GrabCut.
 
 ## 7. RC switches (either instead of, or alongside, QGC)
 
@@ -328,8 +326,8 @@ cd tracker
 
 Drive channel values from another terminal with `simulation/sim_events.py` (check its `--help`; it sets RC
 override values via MAVLink). The rescue channel is read as a **3-position switch**: low = idle/abort,
-low→mid = arm, mid→high = confirm, any position → low = abort. A 2-position switch cannot complete an
-arm+confirm sequence.
+any move up (low→mid or →high) = **GO**; back to low during a dash = stop (BRAKE). With `--go-confirm`: low→mid = arm,
+mid→high = confirm, so a 2-position switch cannot complete it.
 
 ## 8. Shutting down
 
@@ -567,9 +565,14 @@ The simulated red box is moved by teleporting it 10 times a second, so it can kn
 **Kalman prediction** (`track_bench.py`): median 0.09x the target size from the true position (p90 0.23x). No setting moved it;
 it is limited by the box itself.
 
-### GO stop distance and the arrival hook
-`--rescue-standoff M` (default 0 = at the target) sets how far before the target GO ends.
-- Per GO: stdin `go SPEED DIST`, or QGC GO with param1 = speed, param2 = distance.
+### GO speed, stop point and the arrival hook
+The defaults are in one place: the `GO SETTINGS -- EDIT HERE` block at the top of `tracker/main.cpp` (`kSpeed`, `kStopOffset`,
+`kAccel`, and the limits `kMaxSpeed` / `kMaxOffset`). The stop offset is signed: `+10` = stop 10 m before the target, `0` = at it,
+`-10` = fly over it and stop 10 m past it (in the direction GO started flying; the nose then points at the stop point, so it does
+not spin round over the target). A fixed FPV camera loses the target once the drone is over it, so a past-the-target GO finishes
+on the target's last track (a standing target) or holds after 3 s (a moving one).
+- Per launch: `--rescue-speed S --go-offset M --goto-accel A`.
+- Per GO: stdin `go SPEED OFFSET` (e.g. `go 15 -10`; 0 = configured), or QGC GO with param1 = speed, param2 = offset.
 - The actions file has "GO 5 m/s, stop 3 m short" and "GO fast 8 m/s, at target" as editable examples.
 - `on_go_arrived()` in main.cpp is called once on arrival and is deliberately empty: the operator's landing goes there.
 - During GO the gimbal is aimed at the target's world position (up to 60°/s), and the expected box size follows the closing

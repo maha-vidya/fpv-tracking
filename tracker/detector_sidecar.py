@@ -2,8 +2,7 @@
 """ReID sidecar for target_tracker: DINOv2-small appearance fingerprints over localhost UDP.
 
 Only needed when target_tracker was built WITHOUT OpenVINO -- normally `--reid` runs the same model inside the tracker (native_ai.hpp).
-No detector and no segmenter: the project tracks any clicked object without classes (the YOLO / FastSAM / MobileSAM / EdgeSAM paths
-were removed 2026-10-15; they were never used).
+Class-free: the project tracks any clicked object.
 
   python3 detector_sidecar.py --reid ~/models/dinov2            # then: target_tracker ... --reid --ai sidecar
 

@@ -1,8 +1,7 @@
 // In-process ReID model (OpenVINO C++ API): DINOv2-small fingerprints, run on a worker thread inside target_tracker -- no Python
 // sidecar, no JPEG round trip over UDP. Same pre/post-processing as tracker/detector_sidecar.py (DinoReid), so the fingerprints
 // match the sidecar's (cosine 1.0000, measured). Built only when CMake finds OpenVINO (HAVE_OPENVINO); otherwise the tracker can use
-// the sidecar. (EdgeSAM / MobileSAM segmentation was removed 2026-10-15: never used -- the lock box comes from the ground-colour model
-// and GrabCut.)
+// the sidecar.
 // NOTE: included by main.cpp AFTER fl::Box is defined (the members below use it).
 #pragma once
 #include <opencv2/opencv.hpp>

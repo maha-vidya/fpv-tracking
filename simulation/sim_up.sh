@@ -7,6 +7,9 @@
 #   simulation/sim_up.sh --gimbal             # ArduPilot drives the camera gimbal (MNT1), so the tracker can tilt it (--gimbal-centre)
 #   simulation/sim_up.sh --fast               # fast GO dashes: ArduPilot speed/descent/acceleration limits raised (simulation/fast.parm)
 #   simulation/sim_up.sh --c12-camera         # a C12-like 1280x720 ~100 deg camera instead of 640x480 115 deg (people ~2.6x bigger)
+#   simulation/sim_up.sh --fpv-camera         # FPV drone: the same 1280x720 camera FIXED to the airframe (no gimbal), tilted
+#                                             # FPV_CAM_PITCH degrees (default -15, + up), and FPV speed (simulation/fpv.parm:
+#                                             # 30 m/s, 60 deg lean) -- target_tracker --profile sim-fpv
 #   simulation/sim_up.sh --video-to 127.0.0.1:5601 --mav-to 127.0.0.1:14561   # local-only dry run (no Jetson)
 #
 # Starts, each in its own process group, logging to $RUN_DIR (default ~/sim_run):
@@ -30,6 +33,9 @@ GUI=1
 GIMBAL_PARAMS=""
 FAST_PARAMS=""
 C12_CAMERA=0
+FPV_CAMERA=0
+FPV_CAM_PITCH="${FPV_CAM_PITCH:--15}"
+FPV_PARAMS=""
 HERE="$(cd "$(dirname "$0")" && pwd)"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,6 +46,7 @@ while [ $# -gt 0 ]; do
     --fast)     FAST_PARAMS="--add-param-file $HERE/fast.parm"; shift;;   # fast GO dashes: higher speed / descent / acceleration limits (simulation/fast.parm)
     --gimbal)   GIMBAL_PARAMS="--add-param-file $ARDUPILOT_GAZEBO_DIR/config/gazebo-iris-gimbal.parm"; shift;;   # ArduPilot drives the camera gimbal (target_tracker --gimbal-centre)
     --c12-camera) C12_CAMERA=1; shift;;     # a C12-like camera: 1280x720, ~100 deg (target_tracker --profile sim-c12cam)
+    --fpv-camera) FPV_CAMERA=1; C12_CAMERA=1; FPV_PARAMS="--add-param-file $HERE/fpv.parm"; shift;;   # no gimbal, FPV speed (target_tracker --profile sim-fpv)
     --no-gui)   GUI=0; shift;;                # physics + camera only: saves about two CPU cores (open the GUI later with: gz sim -g)
     *) echo "unknown option $1"; exit 2;;
   esac
@@ -89,6 +96,43 @@ PYEOF
   CAM_UDP_PORT=5599
 fi
 
+# 0b. --fpv-camera: an FPV drone has no gimbal -- the camera is bolted to the airframe, so the drone itself turns / climbs to keep
+#     the target in view. The copied gimbal's three joints are welded (type fixed) and the camera sensor is rotated to look forward,
+#     tilted FPV_CAM_PITCH degrees (at zero joint angles it looks straight ahead, level). The copy of iris_with_gimbal drops the
+#     gimbal's servo channels and joint controllers. Same model names, so the world and the camera topic are unchanged.
+if [ "$FPV_CAMERA" = "1" ]; then
+  if [ -n "$GIMBAL_PARAMS" ]; then echo "[sim_up] --fpv-camera has no gimbal: drop --gimbal"; exit 2; fi
+  rm -rf "$RUN_DIR/models/iris_with_gimbal"; cp -r "$ARDUPILOT_GAZEBO_DIR/models/iris_with_gimbal" "$RUN_DIR/models/"
+  python3 - "$RUN_DIR/models" "$FPV_CAM_PITCH" <<'PYEOF'
+import math, re, sys
+d, tilt = sys.argv[1], float(sys.argv[2])
+def rpy(r, p, y):
+    cr, sr, cp, sp, cy, sy = math.cos(r), math.sin(r), math.cos(p), math.sin(p), math.cos(y), math.sin(y)
+    return [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr]]
+mul = lambda A, B: [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+tr = lambda A: [list(r) for r in zip(*A)]
+# the gimbal is mounted at rpy (90, 0, 90) deg on the airframe; the camera should look along the body's x axis, pitched by `tilt`
+# (+ up; a rotation about the body's y axis by -tilt in Gazebo's FLU frame). Sensor rotation = mount^-1 * wanted.
+S = mul(tr(rpy(math.pi / 2, 0, math.pi / 2)), rpy(0, math.radians(-tilt), 0))
+r, p, y = math.atan2(S[2][1], S[2][2]), math.asin(-S[2][0]), math.atan2(S[1][0], S[0][0])
+g = d + "/gimbal_small_3d/model.sdf"; s = open(g).read()
+s, n = re.subn(r'<joint name="(yaw|roll|pitch)_joint" type="revolute">', r'<joint name="\1_joint" type="fixed">', s); assert n == 3, n
+s = re.sub(r'(<joint name="(?:yaw|roll|pitch)_joint" type="fixed">.*?)<axis>.*?</axis>', r'\1', s, flags=re.S)
+s, n = re.subn(r'(<sensor name="camera" type="camera">\s*(?:<[^>]+>[^<]*</[^>]+>\s*)*?)<pose>[^<]*</pose>', r'\g<1><pose>0 0 0 %.6f %.6f %.6f</pose>' % (r, p, y), s, count=1); assert n == 1
+open(g, "w").write(s)
+m = d + "/iris_with_gimbal/model.sdf"; s = open(m).read()
+s = s.replace('<joint name="gimbal_joint" type="revolute">', '<joint name="gimbal_joint" type="fixed">')
+s = re.sub(r'(<joint name="gimbal_joint" type="fixed">.*?)<axis>.*?</axis>', r'\1', s, flags=re.S)
+s, n = re.subn(r'\s*(?:<!--[^>]*-->\s*)?<control channel="(?:8|9|10)">.*?</control>', '', s, flags=re.S); assert n == 3, n
+s, n = re.subn(r'\s*<plugin\s+filename="gz-sim-joint-position-controller-system".*?</plugin>', '', s, flags=re.S); assert n == 3, n
+open(m, "w").write(s)
+print("[sim_up] FPV camera: fixed to the airframe, tilted %.0f deg (sensor rpy %.4f %.4f %.4f)" % (tilt, r, p, y))
+PYEOF
+  [ $? = 0 ] || exit 1
+fi
+
 # 1. Gazebo (NVIDIA offload avoids the slow CPU renderer; see scripts/run_gazebo_laptop.sh)
 export GZ_SIM_SYSTEM_PLUGIN_PATH="$ARDUPILOT_GAZEBO_DIR/build:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}"
 export GZ_SIM_RESOURCE_PATH="$ARDUPILOT_GAZEBO_DIR/models:$ARDUPILOT_GAZEBO_DIR/worlds:${GZ_SIM_RESOURCE_PATH:-}"
@@ -103,7 +147,7 @@ wait_for "Gazebo camera topic" 150 bash -c "gz topic -l | grep -q '${CAM_TOPIC}\
 # 2. SITL (no MAVProxy of its own); parameters layered explicitly as in scripts/run_sitl_laptop.sh
 PARAMS="$ARDUPILOT_DIR/Tools/autotest/default_params"
 ( cd "$ARDUPILOT_DIR" && start sitl ./Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON -w \
-    --add-param-file "$PARAMS/copter.parm" --add-param-file "$PARAMS/gazebo-iris.parm" $GIMBAL_PARAMS $FAST_PARAMS --no-mavproxy )
+    --add-param-file "$PARAMS/copter.parm" --add-param-file "$PARAMS/gazebo-iris.parm" $GIMBAL_PARAMS $FAST_PARAMS $FPV_PARAMS --no-mavproxy )
 # SITL waits for its first client on TCP 5760 before it finishes starting (the other ports open afterwards),
 # so: wait for 5760 -> start MAVProxy (the client) -> wait for the heartbeat on 5762.
 wait_for "SITL listening on tcp:5760" 600 bash -c "ss -tln | grep -q ':5760 '" || exit 1

@@ -27,11 +27,10 @@ def iou(a, b):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dir"); ap.add_argument("--min-iou", type=float, default=0.70); ap.add_argument("--max-ms", type=float, default=150.0)
-    ap.add_argument("--legacy", action="store_true", help="the previous lock path (LOCK_NO_GROUND=1), for A/B")
     a = ap.parse_args()
     fs = sorted(glob.glob(os.path.join(os.path.expanduser(a.dir), "**", "click_*_frame_*_*.png"), recursive=True))
     if not fs: sys.exit("no click_*_frame_X_Y.png images under " + a.dir)
-    env = dict(os.environ, LOCK_WARM="1", **({"LOCK_NO_GROUND": "1"} if a.legacy else {}))
+    env = dict(os.environ, LOCK_WARM="1")
     ious, ms, locked, large = [], [], 0, 0
     for f in fs:
         x, y = map(int, re.search(r"frame_(\d+)_(\d+)\.png$", f).groups())

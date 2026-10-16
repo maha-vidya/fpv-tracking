@@ -158,12 +158,10 @@ SCENARIOS = {
         events=[],
         expect="Forward command follows apparent size; box scale handled by CSRT."),
     "S8_dash": dict(
-        desc="Rescue dash: static target 25 m away; the pilot switch (RC ch9) is pressed twice at t=20 s.", duration=60,
+        desc="Rescue dash: static target 25 m away; the pilot switch (RC ch9) is flipped up ONCE at t=20 s and held through the dash.", duration=60,
         actors={"target": static(0, 25)},
-        events=[(20.0, "rc", dict(channel=9, pwm=1900, seconds=1.0)),
-                (21.5, "rc", dict(channel=9, pwm=1100, seconds=0.6)),
-                (22.5, "rc", dict(channel=9, pwm=1900, seconds=1.0))],
-        expect="Interlocks: first press arms, second within 3 s fires; fast approach; stop; measure stop distance and overshoot."),
+        events=[(20.0, "rc", dict(channel=9, pwm=1900, seconds=15.0))],   # back to low DURING a dash would BRAKE it
+        expect="Interlocks pass, one switch flip fires GO; fast approach; stop; measure stop distance and overshoot."),
     "S9_link_loss": dict(
         desc="MAVLink link to the companion frozen for 6 s while following.", duration=70,
         actors={"target": lateral(0, 15, 4, 50)},

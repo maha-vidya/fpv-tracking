@@ -301,11 +301,10 @@ def t_video_freeze(cam):
 
 def t_rescue(cam):
     hover_ready(); trk = Tracker("rescue"); click_cube(trk, cam); trk.wait_for("LOCKED on", 5); time.sleep(4)
-    t = time.time(); trk.send("go"); time.sleep(5)            # arm only, no confirm -> must time out
-    no_confirm = not trk.has("SENT", since=t) and not trk.has("go-to sent", since=t)
-    record("Confirmation step", "PASS" if no_confirm else "FAIL", "single GO without confirm within 3 s: %s" % [l for (tt, l) in trk.lines if tt >= t][:3])
-    t = time.time(); trk.send("go"); time.sleep(0.8); trk.send("go"); time.sleep(3)
+    # ONE press = GO (the default; the --go-confirm two-step is covered by --selftest's test_rescue)
+    t = time.time(); trk.send("go"); time.sleep(3)
     sent = [l for (tt, l) in trk.lines if tt >= t]
+    record("One-press GO", "PASS" if trk.has("GO-TO sent", since=t) else "FAIL", "a single GO press: %s" % sent[:3])
     record("Destination selection", "PASS" if any("go-to" in l.lower() or "SENT" in l for l in sent) else "FAIL", sent[:3])
     a0 = altitude(); t2 = time.time(); trk.send("abort"); time.sleep(8)
     a1 = altitude(); ab = [l for (tt, l) in trk.lines if tt >= t2 and "ABORT" in l]; mode = current_mode()
@@ -365,9 +364,9 @@ def t_qgc(cam):
     record("QGC LOCK (image centre)", "PASS" if ack == 0 and trk.has("LOCK: the object at the centre", since=t) else "FAIL",
            "ACK %s; %s" % (ack, [l for (tt, l) in trk.lines if tt >= t and ("LOCK" in l or "refused" in l)][:2]))
     cmd(31012, 191); time.sleep(1); click_cube(trk, cam); trk.wait_for("LOCKED on", 5); time.sleep(3)
-    t, ack = cmd(31010, 191); time.sleep(0.6); t2, ack2 = cmd(31010, 191); time.sleep(2)
-    record("QGC GO (arm + confirm)", "PASS" if ack == 0 and ack2 == 0 and trk.has("GO-TO sent", since=t) else "FAIL",
-           "ACK %s/%s; %s" % (ack, ack2, [l for (tt, l) in trk.lines if tt >= t and "GO-TO" in l][:1]))
+    t, ack = cmd(31010, 191); time.sleep(2)                     # ONE press of QGC's Rescue GO
+    record("QGC GO (one press)", "PASS" if ack == 0 and trk.has("GO-TO sent", since=t) else "FAIL",
+           "ACK %s; %s" % (ack, [l for (tt, l) in trk.lines if tt >= t and "GO-TO" in l][:1]))
     a0 = altitude(); t, ack = cmd(31011, 191); time.sleep(6); a1 = altitude()
     record("QGC ABORT", "PASS" if ack == 0 and trk.has("ABORT", since=t) and a1 > a0 + 3 else "FAIL", "ACK %s; altitude %.1f -> %.1f m" % (ack, a0, a1))
     t, ack = cmd(31013, 191); time.sleep(2); mode = current_mode()
@@ -384,7 +383,7 @@ def t_goto_truth(cam, cmd=None, label="Destination movement (GO pursuit)", expec
         if len(d) == 2: truth.append((time.time(), np.array(d["iris_with_gimbal"]), np.array(d["target_red"])))
     n = Node(); n.subscribe(Pose_V, "/world/iris_runway/pose/info", cb)
     hover_ready(); trk = Tracker("gototruth", ["--rescue-speed", "8"]); click_cube(trk, cam); trk.wait_for("LOCKED on", 5); time.sleep(4)
-    t = time.time(); trk.send(cmd or "go"); time.sleep(0.7); trk.send(cmd or "go"); time.sleep(16)
+    t = time.time(); trk.send(cmd or "go"); time.sleep(16)    # one press
     tr = [(tt, a, b) for (tt, a, b) in truth if tt >= t]
     if not tr or not trk.has("GO-TO sent", since=t):
         record("Destination movement (GO pursuit)", "FAIL", "GO not sent: %s" % [l for (tt, l) in trk.lines if tt >= t][:3]); trk.quit(); return
@@ -393,9 +392,9 @@ def t_goto_truth(cam, cmd=None, label="Destination movement (GO pursuit)", expec
     arrived = trk.has("GO-TO arrived", since=t)
     rows = [r for r in trk.rows() if r["t"] >= trk.rows()[0]["t"] and r.get("rescue") is not None]
     # the dash: from GO until arrival (or 12 s)
-    # the dash: the 12 s after the GO confirm, found by the log's own clock (the last ARMED frame) -- counting back a fixed number of
-    # frames assumed 15 fps and, at the tracker's 20 fps, missed the dash entirely ("LOCKED in 0% of frames", a test bug)
-    allr = trk.rows(); armed = [i for i, r in enumerate(allr) if r.get("rescue") == "ARMED"]
+    # the dash: the 12 s after the GO, found by the log's own clock (the SENT frame; ARMED with --go-confirm) -- counting back a fixed
+    # number of frames assumed 15 fps and, at the tracker's 20 fps, missed the dash entirely ("LOCKED in 0% of frames", a test bug)
+    allr = trk.rows(); armed = [i for i, r in enumerate(allr) if r.get("rescue") in ("SENT", "ARMED")]
     dash = []
     if armed:
         t_go = allr[armed[-1]]["t"]

@@ -1,0 +1,28 @@
+# FPV profile for the simulator (sim_up.sh --fpv-camera loads it last, so it wins over fast.parm): FPV speed and agility.
+# Matched to target_tracker --profile sim-fpv (follow up to 30 m/s, GO at 25 m/s). Guided velocity commands are capped by WP_SPD /
+# WP_ACC, so these -- not the tracker -- set how fast the drone can really go.
+# The sim iris hovers at MOT_THST_HOVER 0.39 (thrust/weight ~2.5): it can hold altitude up to ~60 deg of lean, so 60 is the top.
+# Real aircraft: these are flight-safety settings for YOUR airframe's thrust and frame -- choose them deliberately.
+# horizontal speed m/s (default 10; fast.parm 20)
+WP_SPD 30
+# descent / climb m/s (default 1.5 / 2.5): FPV dives and climbs fast (fast descents risk vortex ring state on a real aircraft)
+WP_SPD_DN 8
+WP_SPD_UP 10
+# horizontal acceleration m/s/s (default 2.5; fast.parm 8)
+WP_ACC 15
+# vertical acceleration m/s/s
+WP_ACC_Z 8
+# jerk m/s/s/s (default 1)
+WP_JERK 30
+# tilt limit, degrees (default 30; fast.parm 55): lean = acceleration and top speed
+ATC_ANGLE_MAX 60
+# attitude response time constant s (default 0.15): snappier
+ATC_INPUT_TC 0.1
+# how fast the position controller may change acceleration (default 5 / 5 m/s/s/s)
+PSC_NE_JERK 50
+PSC_D_JERK 30
+# the pilot flying in LOITER: FPV speed there too (LOIT_ANG_MAX 0 = follow ATC_ANGLE_MAX)
+LOIT_SPEED_MS 25
+LOIT_ACC_MAX_M 15
+LOIT_BRK_ACC_M 10
+LOIT_ANG_MAX 0

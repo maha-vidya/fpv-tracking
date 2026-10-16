@@ -76,9 +76,9 @@ else()
 endif()
 
 
-# In-process AI models (DINOv2 ReID, EdgeSAM) through the OpenVINO C++ API -- no Python sidecar needed. The pip package
+# In-process ReID model (DINOv2) through the OpenVINO C++ API -- no Python sidecar needed. The pip package
 # (pip install openvino) ships the C++ headers and CMake config; a system install (OpenVINO_DIR) works too. Off: -DWITH_OPENVINO=OFF.
-option(WITH_OPENVINO "Build the in-process AI models (OpenVINO C++ API)" ON)
+option(WITH_OPENVINO "Build the in-process DINOv2 ReID model (OpenVINO C++ API)" ON)
 if(WITH_OPENVINO)
     if(NOT OpenVINO_DIR)
         execute_process(COMMAND python3 -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'cmake'))"
@@ -90,7 +90,7 @@ if(WITH_OPENVINO)
     find_package(OpenVINO QUIET COMPONENTS Runtime)
 endif()
 if(OpenVINO_FOUND)
-    message(STATUS "OpenVINO ${OpenVINO_VERSION} found (${OpenVINO_DIR}): in-process DINOv2 / EdgeSAM enabled")
+    message(STATUS "OpenVINO ${OpenVINO_VERSION} found (${OpenVINO_DIR}): in-process DINOv2 ReID enabled")
     target_compile_definitions(target_tracker PRIVATE HAVE_OPENVINO=1)
     target_link_libraries(target_tracker PRIVATE openvino::runtime)
     get_filename_component(OV_LIBS_DIR "${OpenVINO_DIR}/../libs" ABSOLUTE)    # the pip package's shared libraries
@@ -98,5 +98,5 @@ if(OpenVINO_FOUND)
         set_target_properties(target_tracker PROPERTIES BUILD_RPATH "${OV_LIBS_DIR}" INSTALL_RPATH "${OV_LIBS_DIR}")
     endif()
 else()
-    message(STATUS "OpenVINO C++ not found: AI models only through the Python sidecar (pip install openvino to enable)")
+    message(STATUS "OpenVINO C++ not found: DINOv2 ReID only through the Python sidecar (pip install openvino to enable)")
 endif()

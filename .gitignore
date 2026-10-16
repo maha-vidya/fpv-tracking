@@ -3,5 +3,7 @@ __pycache__/
 *.tlog
 *.tlog.raw
 *.parm
+!simulation/fast.parm
+!simulation/fpv.parm
 tracker/build/
 tracker/third_party/mavlink/

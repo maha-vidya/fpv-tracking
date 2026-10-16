@@ -10,21 +10,29 @@
         },
         {
             "label": "GO (default)",
-            "description": "1st press arms the GO (shows distance/ETA), 2nd press within 3 s confirms it. Uses the tracker's --rescue-speed and --rescue-standoff (default: to the target)",
+            "description": "ONE press: GO now (with --go-confirm: 1st press arms and shows distance/ETA, 2nd within 3 s confirms). Uses the tracker's --rescue-speed and --go-offset (default: to the target)",
             "mavCmd": 31010,
             "compId": 191
         },
         {
             "label": "GO 5 m/s, stop 3 m short",
-            "description": "GO at 5 m/s, stopping 3 m before the target. Press twice (arm + confirm).",
+            "description": "GO at 5 m/s, stopping 3 m before the target. One press.",
             "mavCmd": 31010,
             "compId": 191,
             "param1": 5,
             "param2": 3
         },
         {
+            "label": "GO, stop 10 m past",
+            "description": "GO at the configured speed, over the target, stopping 10 m PAST it (param2 = -10). One press.",
+            "mavCmd": 31010,
+            "compId": 191,
+            "param1": 0,
+            "param2": -10
+        },
+        {
             "label": "GO fast 8 m/s, at target",
-            "description": "GO at 8 m/s to the target (param1 = speed m/s, param2 = stop distance m; 0 = configured). Press twice (arm + confirm).",
+            "description": "GO at 8 m/s to the target (param1 = speed m/s, param2 = stop offset m: + before the target, - past it; 0 = configured). One press.",
             "mavCmd": 31010,
             "compId": 191,
             "param1": 8,

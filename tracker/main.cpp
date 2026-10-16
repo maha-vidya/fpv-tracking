@@ -1,6 +1,78 @@
 // target_tracker -- companion program for the vision-guided rescue drone (see README.md and docs/RESCUE.md).
 // One C++17 translation unit by deliberate choice, organized into commented sections: follow logic (pure, unit-tested by
 // --selftest), the SkyDroid C12 TOP protocol, the MAVLink link, video capture, and the tracker application.
+//
+// =====================================================================================================================================
+// GO ("go to the target") -- WHERE IT IS AND HOW IT WORKS.  Every part is marked with a [GO-n] banner: search for "[GO-" to jump.
+// =====================================================================================================================================
+// What GO does: once a target is LOCKED and followed, the operator presses GO ONCE (--go-confirm: twice, arm then confirm). The drone then
+// flies FAST, straight at the target's real-world position -- re-aimed every frame, so a moving target is chased, not the spot it
+// left -- and stops at the stop offset (GO SETTINGS below: + before the target, 0 at it, - past it), never lower than --alt-floor
+// above its ground. What happens on arrival (landing, a release, ...) is NOT in this program: on_go_arrived() [GO-7] is the empty
+// hook for it.
+// GO only runs with --enable-rescue (otherwise a GO press just prints that it is disabled).
+//
+//   [GO-1] INPUT        operator presses -> `rescue_press` (main loop, "operator inputs"): key 'g', window GO button, stdin "go" /
+//                       "go SPEED [DIST]", QGC "Rescue GO" = MAV_CMD_USER_1 (param1 = speed, param2 = stop distance), the RC rescue
+//                       switch (low -> mid -> high). ABORT: 'x', stdin "abort", QGC MAV_CMD_USER_2.
+//   [GO-2] PRESS        fl::RescueController: IDLE -press-> SENT (one tick) -> IDLE, if all readiness gates pass: locked >= 2 s,
+//                       GUIDED, armed, link, GPS, EKF, battery, a destination within --rescue-max-range. Refusals say WHICH gate
+//                       failed (fl::not_ready_reason). --go-confirm: the old two-step (press -> ARMED + a preview of distance /
+//                       up-down / ETA to QGC -> press again within 3 s -> SENT).
+//   [GO-3] DESTINATION  main loop "go-to-target": the target's ground position from the camera geometry (fl::view_angles ->
+//                       target_ned_from_view, fused with the box-size range) smoothed by the IMM-UKF track fl::TargetEstimator,
+//                       turned into the end point by fl::pursuit_point (standoff short, height floor).
+//   [GO-4] GUIDANCE     fl::go_velocity (--go-guidance): how the drone flies AT a moving target -- 0 pursuit (where it is),
+//                       1 lead, 2 intercept (where it will be), 3 PN proportional navigation (default). fl::pursuit_velocity brakes
+//                       so the drone stops at the end point: v <= sqrt(2 a d).
+//   [GO-5] START        `ro.send_goto`: this GO's speed / stop distance are fixed, the follow loop hands over (handover_session) and
+//                       the go-to becomes the ONLY controller of the drone (`goto_path_active`, `goto_sent`).
+//   [GO-6] DASH LOOP    every frame while `goto_path_active`: re-aim at the target (live estimate, or its track predicted up to
+//                       1.5 s if hidden), fl::go_velocity -> a velocity + acceleration feed-forward command (update_goto_velocity),
+//                       nose pointed at the target (so a FIXED FPV camera keeps looking at it). --goto-paced: the old paced line.
+//   [GO-7] ARRIVAL      within ~1 m of the end point: "GO-TO arrived" + on_go_arrived() (the operator's own next step). The pursuit
+//                       keeps holding the point relative to the target; it chases again if the target moves > 2 m away.
+//   [GO-8] STOPPING     ABORT ('x' / QGC ABORT / stdin "abort"): brake, climb --abort-climb m, hold in GUIDED.  The RC rescue
+//                       switch back to low during a dash: BRAKE mode.  QGC sends its own go-to: we back off (goto_overridden).
+//                       Target unseen for 3 s: hold the last point (unless it was standing still).  Leaving GUIDED always wins.
+//   [GO-9] MAVLINK      MavlinkLink::send_goto / update_goto_velocity / update_goto_point / cancel_goto / stop_point: the
+//                       SET_POSITION_TARGET_LOCAL_NED messages, re-sent by the 20 Hz command tick until the pilot leaves GUIDED.
+//   [GO-10] CAMERA      gimbal drones only (--gimbal-centre): the gimbal is aimed at the target's world position during the dash.
+//                       FPV (fixed camera): nothing to aim -- the dash points the nose at the target ([GO-6] yaw_to).
+//   [GO-11] TESTS       test_rescue (one-press GO, the gates, --go-confirm) and test_go_guidance (the guidance laws) in --selftest.
+//
+// Speed and stop point: the GO SETTINGS block right below. ArduPilot caps the speed too: WP_SPD / WP_ACC (simulation/fpv.parm).
+// Safety authority stays with ArduPilot (geofence, failsafes).
+// =====================================================================================================================================
+
+// =====================================================================================================================================
+// GO SETTINGS -- EDIT HERE.  The values every GO uses unless overridden at run time. Change a number, rebuild
+// (cmake --build tracker/build -j), done -- nothing else in the code needs touching.
+// Run-time overrides, no rebuild (the most specific wins):
+//   1. ONE GO:        type "go SPEED OFFSET" in the tracker's terminal, e.g.  go 15 -10   (15 m/s, stop 10 m PAST the target)
+//                     or QGC "Rescue GO" with param1 = speed (m/s), param2 = offset (m)  (0 in either = the setting below)
+//   2. ONE LAUNCH:    target_tracker ... --rescue-speed 15 --go-offset -10 --goto-accel 6
+//   3. these defaults
+// =====================================================================================================================================
+namespace go_settings {
+// GO speed, m/s: how fast the dash flies. ArduPilot also caps it at WP_SPD (simulation/fpv.parm: 30 m/s) -- to go faster, raise
+// that too, and kMaxSpeed below.
+constexpr double kSpeed = 30.0;
+// WHERE GO STOPS, metres, measured horizontally along the line GO flies:
+//   +10  stop 10 m BEFORE the target (short of it)
+//     0  stop AT the target
+//   -10  fly over the target and stop 10 m PAST it (in the direction GO was flying when it started)
+// The stop point is never lower than --alt-floor above the target's ground, whatever the offset. A moving target is followed:
+// the stop point moves with it. What happens there (landing, a release) is your code in on_go_arrived() [GO-7].
+constexpr double kStopOffset = -20;
+// Braking (and speed-up) rate, m/s^2: the dash slows down at this rate so it stops ON the stop point. Higher = brakes later and
+// harder (the drone tilts more: a fixed FPV camera can lose the target above ~8). Allowed 0.5 .. 10.
+constexpr double kAccel = 0.0;
+// Limits for run-time values (typos, a wrong QGC param): faster than kMaxSpeed or an offset beyond +-kMaxOffset is clamped.
+constexpr double kMaxSpeed = 30.0;
+constexpr double kMaxOffset = 100.0;
+// (--profile sim-c12cam, the old gimbal-camera profile, still sets its own GO speed 12 m/s and braking 6 m/s^2.)
+}  // namespace go_settings
 
 #include <array>
 #include <atomic>
@@ -347,9 +419,7 @@ inline bool flow_region(const cv::Mat& prev, const cv::Mat& cur, double px, doub
     cv::Mat flow;
     {
         static thread_local cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(cv::DISOpticalFlow::PRESET_FAST);
-        static const bool farneback = std::getenv("LOCK_FARNEBACK") != nullptr;   // A/B against the previous flow
-        if (farneback) cv::calcOpticalFlowFarneback(w0, g1(rin), flow, 0.5, 3, 15, 3, 5, 1.2, 0);
-        else dis->calc(w0, g1(rin).clone(), flow);
+        dis->calc(w0, g1(rin).clone(), flow);
     }
     const int cx = (int)std::lround(px - roi.x), cy = (int)std::lround(py - roi.y);
     if (cx < 0 || cy < 0 || cx >= flow.cols || cy >= flow.rows) return false;
@@ -521,11 +591,10 @@ inline double box_contrast(const cv::Mat& frame, const Box& b) {
 
 inline bool lock_box_from_click(const cv::Mat& frame, const cv::Mat& prev, double prev_scale, double px, double py, Box& out, std::string& why, std::string& how,
                                 bool allow_point = true) {
-    static const bool no_ground = std::getenv("LOCK_NO_GROUND") != nullptr;   // A/B: the previous lock path
     static const bool timing = std::getenv("LOCK_TIMING") != nullptr;
     auto ms_since = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); };
     auto tg = std::chrono::steady_clock::now();
-    Box G; bool have_g = !no_ground && ground_model_from_point(frame, px, py, G);
+    Box G; bool have_g = ground_model_from_point(frame, px, py, G);
     // a "found object" that looks like its own surroundings is ground (a shadow edge, a paint boundary): measured, clicks on empty
     // runway locked 140x190 boxes of plain ground
     if (have_g && box_contrast(frame, G) < 10.0) have_g = false;
@@ -631,8 +700,7 @@ inline std::vector<cv::Point2d> objects_near(const cv::Mat& prev, const cv::Mat&
 // the object still runs into its border. Accepted only if it contains the click, is at least the box, stands out from its own
 // surroundings, and did not just fill the window (= no real boundary: open ground). Else the box is kept.
 inline bool complete_object(const cv::Mat& frame, const Box& b, double px, double py, Box& out) {
-    static const bool off = std::getenv("LOCK_NO_COMPLETE") != nullptr;   // A/B
-    if (off || !b.valid()) return false;
+    if (!b.valid()) return false;
     const cv::Rect img(0, 0, frame.cols, frame.rows);
     // windows: 2.5x the box (>= 64 px), then doubling while the object runs into the border -- up to the whole view (a van filling
     // the view from close up: the click's region was 9x11 px of it)
@@ -970,8 +1038,7 @@ public:
         // i.e. exactly when it then got lost. When the position innovation is improbable for the filter's own uncertainty (NIS >
         // 9, i.e. beyond ~3 sigma), the velocity uncertainty is re-opened in proportion, so this and the next measurements pull
         // the velocity to the new motion at once; a target moving steadily never triggers it (small and slow ones stay smooth).
-        static const bool no_adapt = std::getenv("KF_NO_ADAPT") != nullptr;   // A/B
-        if (!no_adapt && adaptive) {
+        if (adaptive) {
             const double ex = z[0] - x_[0], ey = z[1] - x_[1];
             const double nis = ex * (Sinv[0] * ex + Sinv[1] * ey) + ey * (Sinv[4] * ex + Sinv[5] * ey);
             if (nis > 9.0) {
@@ -1080,23 +1147,21 @@ private:
 // re-weights them by how well each one had predicted it -- so the output is the calm filter's smoothness while the target behaves,
 // and follows a manoeuvre within a frame or two when it does not (the single filter either lagged turns or was noisy on straight
 // runs). A UKF would not help here: the box motion and the measurement are both linear in the image, where a UKF equals a KF.
-// Same interface as BoxKalman; KF_NO_IMM=1 falls back to one filter with the NIS-based manoeuvre detection (A/B).
+// Same interface as BoxKalman.
 class TargetFilter {
 public:
     // r_frac 0.05 (was 0.08): measured on the fast-turning / tiny clips, p90 prediction error 0.46 -> 0.35 / 0.31 -> 0.26 box sizes,
     // no change on the steady clip
     explicit TargetFilter(const Box& b0 = Box(), double r_frac = 0.05, double q_pos = 1.0, double q_vel = 0.5) {
-        static const bool off = std::getenv("KF_NO_IMM") != nullptr;
         static const double qc = std::getenv("IMM_QC") ? std::atof(std::getenv("IMM_QC")) : 0.3;   // calm velocity noise (px/frame)
         static const double qm = std::getenv("IMM_QM") ? std::atof(std::getenv("IMM_QM")) : 3.0;   // manoeuvre velocity noise
-        imm_ = !off;
-        m_[0] = BoxKalman(b0, r_frac, q_pos, imm_ ? qc : q_vel); m_[1] = BoxKalman(b0, r_frac, q_pos, qm);
-        m_[0].adaptive = !imm_; m_[1].adaptive = false;
+        (void)q_vel;                                     // the calm model's velocity noise is qc
+        m_[0] = BoxKalman(b0, r_frac, q_pos, qc); m_[1] = BoxKalman(b0, r_frac, q_pos, qm);
+        m_[0].adaptive = false; m_[1].adaptive = false;
         reset(b0);
     }
     void reset(const Box& b0) { m_[0].reset(b0); m_[1].reset(b0); mu_ = {0.9, 0.1}; c_ = mu_; }
     void predict(double steps = 1.0) {
-        if (!imm_) { m_[0].predict(steps); return; }
         // switching probabilities over `steps` frames (calm -> manoeuvre 5%/frame, back 15%/frame)
         const double p01 = std::min(0.5, 0.05 * steps), p10 = std::min(0.5, 0.15 * steps);
         const double PI[2][2] = {{1 - p01, p01}, {p10, 1 - p10}};
@@ -1114,7 +1179,6 @@ public:
         mu_ = c_;                                    // the predicted mode probabilities (until a measurement re-weights them; review)
     }
     void update(const Box& m) {
-        if (!imm_) { m_[0].update(m); return; }
         double L[2];
         for (int j = 0; j < 2; j++) { m_[j].update(m); L[j] = m_[j].last_lik(); }
         const double s0 = L[0] * c_[0], s1 = L[1] * c_[1], sum = s0 + s1;
@@ -1128,25 +1192,23 @@ public:
     double vx() const { return mixed()[4]; }
     double vy() const { return mixed()[5]; }
     double p(int r, int c) const {
-        if (!imm_) return m_[0].p(r, c);
         const auto x = mixed(); double v = 0;
         for (int j = 0; j < 2; j++) { const auto& xj = m_[j].state(); v += mu_[j] * (m_[j].p(r, c) + (xj[r] - x[r]) * (xj[c] - x[c])); }
         return v;
     }
-    double manoeuvre_prob() const { return imm_ ? mu_[1] : 0.0; }
+    double manoeuvre_prob() const { return mu_[1]; }
 private:
     std::array<double, 6> mixed() const {
-        if (!imm_) return m_[0].state();
         std::array<double, 6> x{}; for (int j = 0; j < 2; j++) for (int i = 0; i < 6; i++) x[i] += mu_[j] * m_[j].state()[i];
         return x;
     }
-    BoxKalman m_[2]; std::array<double, 2> mu_{0.9, 0.1}, c_{0.9, 0.1}; bool imm_ = true;
+    BoxKalman m_[2]; std::array<double, 2> mu_{0.9, 0.1}, c_{0.9, 0.1};
 };
 
 // The filter's own GATE for a new box: the jump from the prediction must lie within ~4 sigma of the filter's position uncertainty
 // (plus the measurement noise), never tighter than 60% of the box nor wider than the fixed plausibility limit. Steady target: a
 // tight gate -- CSRT hopping onto a neighbour 1-2 box widths away is refused (live: the box jumped 54-158 px onto other objects);
-// manoeuvring target: the IMM's manoeuvre model widens it, so the true motion still passes. KF_NO_GATE=1: off (A/B).
+// manoeuvring target: the IMM's manoeuvre model widens it, so the true motion still passes.
 // The floor also scales with the target's own image speed (2.5x per frame) and the box: a gate that rejects the very measurement
 // showing a manoeuvre never lets the filter see it (measured: a 14 px target reversing at 14 px/frame -- tracked 100% -> 17%
 // with a 0.6-box floor). A slow, steady target keeps a tight gate.
@@ -1157,8 +1219,7 @@ inline double gate_radius(const TargetFilter& kf, const Box& pred, double steps 
     return std::max({0.8 * sz + 2.5 * spd, 4.0 * sigma, 15.0});
 }
 inline bool filter_gate(const TargetFilter& kf, const Box& pred, const Box& b, double steps = 1.0, double widen = 1.0) {
-    static const bool off = std::getenv("KF_NO_GATE") != nullptr;
-    if (off || !b.valid() || !pred.valid()) return true;
+    if (!b.valid() || !pred.valid()) return true;
     const double lim = widen * gate_radius(kf, pred, steps);
     return std::hypot(b.cx() - pred.cx(), b.cy() - pred.cy()) <= lim;
 }
@@ -1202,14 +1263,18 @@ inline double best_view_vz(double box_h_frac, double min_frac, double max_frac, 
 // strafe = true (--lateral-mode strafe, from the previous iteration's follow law): centre the target by sliding sideways (vy)
 // instead of turning, so the heading stays where the pilot put it -- useful with a forward camera on a fixed-heading pass, or
 // when turning would swing a body-fixed camera off a second object of interest.
+// vert_err_rad: the vertical error to centre on instead of the raw image row (a camera fixed to the airframe, see
+// body_cam_vertical_error); NaN = the image row.
 inline Cmd image_control(const Box& b, double ref_h, const Intrinsics& k, const Gains& g, const Ceilings& c,
-                         double yaw_offset_rad = 0.0, bool centre_vz = true, bool strafe = false) {
+                         double yaw_offset_rad = 0.0, bool centre_vz = true, bool strafe = false,
+                         double vert_err_rad = std::numeric_limits<double>::quiet_NaN()) {
     Cmd out;
     if (!b.valid() || ref_h <= 1.0) return out;
     const double bearing = deadband(yaw_offset_rad + std::atan((b.cx() - k.cx) / k.fx), g.db_yaw);
     if (strafe) out.vy = g.klat * bearing;                                            // target right -> slide right
     else out.yaw_rate = g.kyaw * bearing;
-    if (centre_vz) out.vz = g.kz * deadband(std::atan((b.cy() - k.cy) / k.fy), g.db_z);   // target below centre -> descend
+    const double verr = std::isfinite(vert_err_rad) ? vert_err_rad : std::atan((b.cy() - k.cy) / k.fy);
+    if (centre_vz) out.vz = g.kz * deadband(verr, g.db_z);                            // target below centre -> descend
     out.vx = g.kx * deadband((ref_h - b.h) / ref_h, g.db_x);                          // smaller than at lock -> go forward
     return clamp_keep_direction(out, c);
 }
@@ -1443,6 +1508,38 @@ inline ViewAngles view_angles(double px_right, double px_down, double fx, double
     return v;
 }
 
+// Vertical centring error for a camera FIXED to the airframe (an FPV drone: no gimbal, so the drone itself climbs / descends to
+// keep the target in view). The raw image row is the wrong error there: pitching nose-down to accelerate tilts the camera down with
+// the airframe, the target jumps up in the image, and a loop centring the image row climbs for its own pitch (and descends when it
+// brakes) -- altitude coupled to every speed change. Instead the target's depression below the HORIZON (attitude removed, as for the
+// ground estimate) is held at a reference: ref_dep_rad, the depression at lock (the framing the pilot chose), or -- NaN -- the
+// camera's level-flight boresight (in a hover exactly the image centre). A pitch change no longer moves the error. Only when the
+// airframe is pitched so far that the target would leave the view is the reference pulled towards the actual boresight (kept within
+// `keep_frac` of the half vertical field of view, half_vfov_rad) -- at FPV lean angles (40-60 deg) this is what keeps it in frame.
+// + = the target is below the reference -> descend (image_control's convention).
+inline double body_cam_depression(double px_right, double px_down, double fx, double fy, double cam_yaw_deg, double cam_pitch_deg,
+                                  double veh_pitch_rad, double veh_roll_rad) {
+    return view_angles(px_right, px_down, fx, fy, cam_yaw_deg, cam_pitch_deg, false, veh_pitch_rad, veh_roll_rad).depression;
+}
+inline double body_cam_vertical_error(double px_right, double px_down, double fx, double fy, double cam_yaw_deg, double cam_pitch_deg,
+                                      double veh_pitch_rad, double veh_roll_rad, double half_vfov_rad,
+                                      double ref_dep_rad = std::numeric_limits<double>::quiet_NaN(), double keep_frac = 0.7) {
+    const double dep = body_cam_depression(px_right, px_down, fx, fy, cam_yaw_deg, cam_pitch_deg, veh_pitch_rad, veh_roll_rad);
+    const double ref = std::isfinite(ref_dep_rad) ? ref_dep_rad : body_cam_depression(0, 0, 1, 1, cam_yaw_deg, cam_pitch_deg, 0.0, 0.0);
+    const double now_b = body_cam_depression(0, 0, 1, 1, cam_yaw_deg, cam_pitch_deg, veh_pitch_rad, veh_roll_rad);   // actual boresight
+    const double m = keep_frac * half_vfov_rad;
+    return dep - std::clamp(ref, now_b - m, now_b + m);
+}
+
+// =====================================================================================================================================
+// [GO-2] ARM / CONFIRM -- the GO state machine (pure logic, tested by test_rescue). See the GO map at the top of the file.
+//   ONE press = GO (default): IDLE -press-> SENT. --go-confirm: IDLE -press-> ARMED -press within 3 s-> SENT.
+//   RState: DISABLED (no --enable-rescue) | IDLE (waiting for a press) | ARMED (--go-confirm only: confirm window open) |
+//           SENT (send the go-to now; lasts ONE tick, then back to IDLE so the officer can GO again / redirect)
+//   REnd:   why the last attempt ended (shown to the officer): aborted, mode changed, link lost, not ready, timeout, too far
+//   RescueIn: everything the gates need this frame (lock, mode, link, GPS, EKF, battery, the destination); RescueOut.send_goto is
+//   true on the single tick the main loop must start the dash ([GO-5]).
+// =====================================================================================================================================
 enum class RState { DISABLED, IDLE, ARMED, SENT };
 enum class REnd { NONE, ABORTED, MODE_CHANGED, LINK_LOST, NOT_READY, CONFIRM_TIMEOUT, OUT_OF_RANGE };
 inline const char* to_str(RState s) {
@@ -1460,7 +1557,8 @@ inline const char* to_str(REnd e) {
 struct RescueCfg {
     bool enabled = false;
     double speed_ms = 5.0;            // ground speed for the transit (DO_CHANGE_SPEED); the vehicle's WP_SPD must allow it
-    double confirm_window_s = 3.0;    // second press (confirm) must come within this
+    bool confirm = false;             // false (default): ONE press goes. true (--go-confirm): press to arm, press again to confirm
+    double confirm_window_s = 3.0;    // --go-confirm: the second press (confirm) must come within this
     double min_locked_s = 2.0;        // locked at least this long before arming
     double max_range_m = 150.0;       // refuse destinations farther than this from the vehicle
     double min_battery_pct = 0;       // refuse to arm below this battery percentage (0 = off; unknown battery passes)
@@ -1502,8 +1600,9 @@ inline std::string not_ready_reason(const RescueIn& in, const RescueCfg& cfg) {
     return "";
 }
 
-// Officer presses once -> ARMED (a confirm window opens); presses again within the window -> the ONE go-to command is sent and the
-// controller returns to IDLE so another go-to can be confirmed later (e.g. the officer redirects it).
+// ONE press (default): if every readiness gate passes, the go-to is sent at once (SENT for one tick, then IDLE: another press
+// re-sends GO at the target's current position, e.g. to redirect it). --go-confirm restores the two-step: press once -> ARMED
+// (a confirm window opens), press again within the window -> sent.
 class RescueController {
 public:
     explicit RescueController(RescueCfg c = RescueCfg()) : cfg_(c) { st_ = cfg_.enabled ? RState::IDLE : RState::DISABLED; }
@@ -1520,7 +1619,11 @@ public:
         switch (st_) {
             case RState::IDLE:
                 if (in.press) {
-                    if (ready) { st_ = RState::ARMED; armed_at_ = in.now; o.transitioned = true; }
+                    if (ready && !cfg_.confirm) {                                 // ONE-PRESS GO: the same gates, then go at once
+                        if (std::hypot(in.dest.n - in.veh.n, in.dest.e - in.veh.e) > cfg_.max_range_m) { end_ = REnd::OUT_OF_RANGE; o.end = end_; o.transitioned = true; }
+                        else { st_ = RState::SENT; o.dest = in.dest; o.send_goto = true; o.transitioned = true; end_ = REnd::NONE; }
+                    }
+                    else if (ready) { st_ = RState::ARMED; armed_at_ = in.now; o.transitioned = true; }   // --go-confirm: arm, wait for the 2nd press
                     else { end_ = REnd::NOT_READY; o.end = end_; o.detail = not_ready_reason(in, cfg_); o.transitioned = true; }
                 }
                 break;
@@ -1601,11 +1704,11 @@ private:
 // Each update re-weights the two by how well each predicted the fix; the output and the look-ahead (predict) blend them. A vehicle
 // turning a corner is now predicted ALONG ITS ARC (the GO aim point, the speed match), where the old straight-line filter put it
 // off the outside of the turn and lagged its new direction. The fix itself is linear (position), so the update is a plain Kalman
-// update on the predicted moments. EST_OLD=1: the previous straight-line filter (A/B).
+// update on the predicted moments. imm = 0: the straight-line filter (the self-test baseline).
 class TargetEstimator {
 public:
-    // imm: 1 = IMM-UKF, 0 = the previous straight-line filter, -1 = IMM unless EST_OLD is set
-    explicit TargetEstimator(double q_acc = 2.0, int imm = -1) : q_acc_(q_acc) { static const bool old = std::getenv("EST_OLD") != nullptr; imm_ = imm < 0 ? !old : imm == 1; }
+    // imm: 1 = IMM-UKF (always, live), 0 = the straight-line filter (the self-test baseline only)
+    explicit TargetEstimator(double q_acc = 2.0, int imm = 1) : q_acc_(q_acc), imm_(imm != 0) {}
     void reset() { n_ = 0; }
     // meas: the per-frame ground position; sigma_m: its 1-sigma error (grows with range -- see geometry_sigma)
     void update(double now, const Ned& meas, double sigma_m) {
@@ -1816,15 +1919,37 @@ inline double bearing_rate(double dn, double de, double rvn, double rve) {
     return d2 > 1e-6 ? (dn * rve - de * rvn) / d2 : 0.0;
 }
 
-// GO (pursuit): the point to fly to RIGHT NOW -- `standoff` metres short of the target's CURRENT position on the straight 3D line
-// from the vehicle to it, never lower than `floor_d` (NED down: the end point is at least that high). Re-evaluated every frame
-// while the dash runs, so a moving target is chased, not a point it has left; within the standoff the vehicle simply holds.
-inline Ned pursuit_point(const Ned& veh, const Ned& tgt, double standoff, double floor_d) {
-    // the stop distance is HORIZONTAL ("stop 3 m before the target"): measured in 3D, with the drone held at the height floor above the
+// =====================================================================================================================================
+// [GO-4] GUIDANCE -- how the drone flies at the target during the dash (pure functions, tested by test_go_guidance).
+//   pursuit_point    the end point: `standoff` short of the target, never below the height floor
+//   pursuit_velocity straight at a point, braking so it stops there (v <= sqrt(2 a d), allowing for the autopilot's lag)
+//   intercept_point  where a moving target will be when the drone reaches it (iterated time-to-go)
+//   go_velocity      the command for each --go-guidance mode (0 pursuit, 1 lead, 2 intercept, 3 PN), capped at the GO speed
+//   pace_along       the old --goto-paced mode only: a point paced along a fixed line with a braking taper
+// Used every frame by the dash loop [GO-6]. See the GO map at the top of the file.
+// =====================================================================================================================================
+// GO STOP POINT: where the dash ends RIGHT NOW, from the target's CURRENT position and the signed offset `standoff` (metres,
+// horizontal -- go_settings::kStopOffset / --go-offset / "go SPEED OFFSET"):
+//   standoff > 0  BEFORE the target: that far short of it on the line from the vehicle to it; closer than that = hold where it is
+//   standoff = 0  AT the target
+//   standoff < 0  PAST the target: |standoff| beyond it, along the APPROACH direction from `from` (where GO started) to the target.
+//                 Not from the vehicle: its own direction to the target flips as it flies over, which would turn the stop point
+//                 round behind it. Without `from`, the vehicle (fine for the one-off estimate at the press, where they coincide).
+// Never lower than `floor_d` (NED down: the stop point is at least that high). Re-evaluated every frame while the dash runs, so a
+// moving target is chased, not a point it has left.
+inline Ned pursuit_point(const Ned& veh, const Ned& tgt, double standoff, double floor_d, const Ned* from = nullptr) {
+    // the offset is HORIZONTAL ("stop 3 m before the target"): measured in 3D, with the drone held at the height floor above the
     // target most of it went into height -- `go 5 3` stopped 0.9 m short horizontally (suite)
     const double dn = tgt.n - veh.n, de = tgt.e - veh.e, dh = std::hypot(dn, de);
     Ned e{veh.n, veh.e, tgt.d};
-    if (dh > standoff) { const double k = (dh - standoff) / dh; e.n = veh.n + k * dn; e.e = veh.e + k * de; }
+    if (standoff >= 0) {
+        if (dh > standoff) { const double k = (dh - standoff) / dh; e.n = veh.n + k * dn; e.e = veh.e + k * de; }
+    } else {
+        const Ned& o = from ? *from : veh;
+        const double an = tgt.n - o.n, ae = tgt.e - o.e, ah = std::hypot(an, ae);
+        if (ah > 1e-3) { e.n = tgt.n - standoff * an / ah; e.e = tgt.e - standoff * ae / ah; }   // standoff < 0: beyond the target
+        else { e.n = tgt.n; e.e = tgt.e; }                              // started right above it: no approach direction, stop at it
+    }
     if (e.d > floor_d) e.d = floor_d;                                   // too low: hold the floor height (NED d grows downward)
     return e;
 }
@@ -1867,11 +1992,12 @@ inline Ned intercept_point(const Ned& veh, double speed, const Predict& predict,
 // The total is capped at the GO speed (direction kept). Vertical: as the pursuit's.
 template <class Predict>
 inline Ned go_velocity(int mode, const Ned& veh, const Ned& v_veh, const Ned& tgt, const Ned& v_tgt, const Predict& predict,
-                       double standoff, double floor_d, double speed, double acc, double lag, double N) {
+                       double standoff, double floor_d, double speed, double acc, double lag, double N, const Ned* from = nullptr) {
+    // standoff: the signed stop offset (+ before / - past the target), `from`: where GO started -- see pursuit_point
     const double vnow = std::sqrt(v_veh.n * v_veh.n + v_veh.e * v_veh.e + v_veh.d * v_veh.d);
-    if (mode == 0) return pursuit_velocity(veh, pursuit_point(veh, tgt, standoff, floor_d), vnow, speed, acc, lag);
+    if (mode == 0) return pursuit_velocity(veh, pursuit_point(veh, tgt, standoff, floor_d, from), vnow, speed, acc, lag);
     const Ned aim = mode == 2 ? intercept_point(veh, speed, predict) : tgt;
-    const Ned end = pursuit_point(veh, aim, standoff, floor_d);
+    const Ned end = pursuit_point(veh, aim, standoff, floor_d, from);
     const Ned vrel{v_veh.n - v_tgt.n, v_veh.e - v_tgt.e, v_veh.d - v_tgt.d};
     const double vrel_m = std::sqrt(vrel.n * vrel.n + vrel.e * vrel.e + vrel.d * vrel.d);
     Ned v = pursuit_velocity(veh, end, vrel_m, speed, acc, lag);                 // closing velocity, braked on the relative motion
@@ -2166,12 +2292,11 @@ private:
 
 // ============================================================
 // ---- optional ReID sidecar (tracker/detector_sidecar.py): DINOv2 fingerprints over localhost UDP -- the fallback when this
-// build has no OpenVINO (the in-process models in native_ai.hpp are preferred). No detector, no segmenter: the project tracks any
-// clicked object without classes (YOLO / SAM paths were removed 2026-10-15 -- never used).
+// build has no OpenVINO (the in-process model in native_ai.hpp is preferred). Class-free: the project tracks any clicked object.
 //   tracker -> sidecar (port P):    "TTE1 <id>\n" + JPEG crop
 //   sidecar -> tracker (port P+1):  "TTV1 <id> <n> v1 ... vn"
 // ============================================================
-#include "native_ai.hpp"                                       // the in-process models (and the AiBackend interface)
+#include "native_ai.hpp"                                       // the in-process ReID model (and the AiBackend interface)
 
 class DetectorLink : public AiBackend {
 public:
@@ -2455,6 +2580,7 @@ void test_color_plausible() {
     CHECK(r3 == red);
 }
 
+// [GO-11] TESTS: one-press GO, the readiness gates and the --go-confirm two-step of [GO-2].
 void test_rescue() {
     using namespace fl;
     Ned veh{0, 0, -10}, t;                                                          // 10 m up, facing north
@@ -2465,7 +2591,18 @@ void test_rescue() {
     CHECK(!target_ned_from_view(veh, 0.0, 0.2, 0.0, deg2rad(45), deg2rad(10), t));                                                               // too low
     NEAR(bearing_to(Ned{0, 0, 0}, Ned{0, 10, 0}), kPi / 2, 1e-9);
 
-    RescueCfg cfg; cfg.enabled = true;
+    // ONE-PRESS GO (default): a single press with every gate passing sends the go-to at once
+    {
+        RescueCfg oc; oc.enabled = true; RescueController c(oc);
+        RescueIn x; x.now = 1.0; x.follow = FState::LOCKED; x.locked_for = 5; x.dest_ok = true; x.dest = Ned{24, 0, -8}; x.veh = Ned{0, 0, -8}; x.press = true;
+        RescueOut q = c.step(x); CHECK(q.send_goto); NEAR(q.dest.n, 24.0, 1e-9); CHECK(c.state() == RState::SENT);
+        x.press = false; x.now = 1.1; c.step(x); CHECK(c.state() == RState::IDLE);                       // one tick, then ready again
+        x.press = true; x.now = 5.0; CHECK(c.step(x).send_goto);                                         // another press: GO again
+        x.now = 6.0; x.locked_for = 0.5; q = c.step(x); CHECK(!q.send_goto); CHECK(q.end == REnd::NOT_READY);   // the gates still apply
+        x.locked_for = 5; x.dest = Ned{400, 0, -8}; q = c.step(x); CHECK(!q.send_goto); CHECK(q.end == REnd::OUT_OF_RANGE);
+    }
+    // --go-confirm: the two-step (everything below)
+    RescueCfg cfg; cfg.enabled = true; cfg.confirm = true;
     auto ready = [&](double now) { RescueIn i; i.now = now; i.follow = FState::LOCKED; i.locked_for = 5; i.dest_ok = true; i.dest = Ned{24, 0, -8}; i.veh = Ned{0, 0, -8}; return i; };
     RescueController off; CHECK(off.state() == RState::DISABLED); RescueIn p = ready(0); p.press = true; CHECK(!off.step(p).send_goto);
     RescueController r(cfg); RescueIn e0 = ready(0); e0.press = true; e0.locked_for = 0.5; RescueOut o = r.step(e0); CHECK(o.end == REnd::NOT_READY); CHECK(r.state() == RState::IDLE);
@@ -2528,6 +2665,26 @@ void test_view_angles() {
     CHECK(image_control(centred, 60, k, g, c, deg2rad(30)).yaw_rate > 0);                     // gimbal panned right: turn right
     Box below{k.cx - 20, k.cy + 80 - 30, 40, 60};
     CHECK(image_control(below, 60, k, g, c, 0, false).vz == 0.0);                             // vz hold: no altitude chasing
+    // FPV (camera fixed to the airframe, tilted 30 deg down): the vertical error is the depression below the horizon vs the
+    // level-flight boresight, so the drone's own pitch does not move it
+    const double hv = deg2rad(30);
+    NEAR(body_cam_vertical_error(0, 0, f, f, 0, -30, 0, 0, hv), 0.0, 1e-12);                                  // hover, centred
+    // nose down 10 deg to accelerate: the same target now shows 10 deg ABOVE the image centre -- still no error (the image row
+    // alone would have read -10 deg and climbed)
+    NEAR(body_cam_vertical_error(0, -f * std::tan(deg2rad(10)), f, f, 0, -30, deg2rad(-10), 0, hv), 0.0, 1e-9);
+    NEAR(body_cam_vertical_error(0, f * std::tan(deg2rad(5)), f, f, 0, -30, 0, 0, hv), deg2rad(5), 1e-9);    // below: + (descend)
+    // banked 40 deg: a tilted camera's centre really does look less steeply down (asin(sin 30 cos 40) = 22.5 deg) -- the error is
+    // that true difference, -7.5 deg, not the image row's 0
+    NEAR(body_cam_vertical_error(0, 0, f, f, 0, -30, 0, deg2rad(40), hv), std::asin(0.5 * std::cos(deg2rad(40))) - deg2rad(30), 1e-9);
+    // pitched 45 deg nose-down (a hard dash): a target held at the level boresight (30 deg down) would sit 45 deg above the centre,
+    // outside a 30 deg half view -- the reference is pulled to within 0.7 x 30 deg of the actual boresight (75 deg): error -24 deg (climb)
+    NEAR(body_cam_vertical_error(0, -f * std::tan(deg2rad(45)), f, f, 0, -30, deg2rad(-45), 0, hv), deg2rad(30 - 54), 1e-9);
+    // FPV speed, camera -15 deg, locked with the target 40 deg down (ref): leaning 45 deg nose-down the boresight looks 60 deg down,
+    // the target shows 20 deg above the centre -- inside the 0.7 x 30 deg band, so the lock-time framing is held: no error
+    NEAR(body_cam_vertical_error(0, -f * std::tan(deg2rad(20)), f, f, 0, -15, deg2rad(-45), 0, hv, deg2rad(40)), 0.0, 1e-9);
+    NEAR(body_cam_vertical_error(0, 0, f, f, 0, -15, 0, 0, hv, deg2rad(40)), deg2rad(15 - 36), 1e-9);   // hover: ref clamped to 15+21
+    CHECK(image_control(centred, 60, k, g, c, 0, true, false, deg2rad(5)).vz > 0);           // the override drives vz: descend
+    CHECK(image_control(below, 60, k, g, c, 0, true, false, 0.0).vz == 0.0);                 // ... and replaces the image row
 }
 
 void test_height() {
@@ -2742,8 +2899,24 @@ void test_imm() {
 
 // GO guidance on a simulated drone (velocity response 0.4 s, <= 6 m/s^2) at 10 m/s against a target CROSSING at 5 m/s 40 m ahead,
 // and one TURNING (5 m/s, 0.25 rad/s): time to reach it (< 1.5 m). Intercept and PN must beat the tail-chasing pursuit.
+// [GO-11] TESTS: the guidance laws of [GO-4] against moving / turning / crossing targets.
 void test_go_guidance() {
     using namespace fl;
+    // the SIGNED stop offset (go_settings::kStopOffset): + before the target, 0 at it, - past it along the approach direction
+    {
+        const Ned start{0, 0, -10}, tgt{20, 0, 0}; const double floor_d = -3;       // target 20 m north, stop >= 3 m above its ground
+        Ned e = pursuit_point(start, tgt, 10, floor_d, &start); NEAR(e.n, 10, 1e-9); NEAR(e.d, -3, 1e-9);   // +10: 10 m BEFORE
+        e = pursuit_point(start, tgt, 0, floor_d, &start);      NEAR(e.n, 20, 1e-9);                         // 0: AT it
+        e = pursuit_point(start, tgt, -10, floor_d, &start);    NEAR(e.n, 30, 1e-9); NEAR(e.e, 0, 1e-9); NEAR(e.d, -3, 1e-9);   // -10: PAST
+        // flown OVER the target (vehicle at 25 m): the past-stop stays 10 m beyond it in the approach direction, not behind the drone
+        e = pursuit_point(Ned{25, 0, -5}, tgt, -10, floor_d, &start); NEAR(e.n, 30, 1e-9);
+        auto none = [](double) { return Ned{20, 0, 0}; };
+        // right over the target with a -10 offset the dash still flies ON (northwards), towards the point beyond
+        const Ned v = go_velocity(0, Ned{20, 0, -3}, Ned{10, 0, 0}, tgt, Ned{}, none, -10, floor_d, 25, 8, 0.5, 3, &start);
+        CHECK(v.n > 1.0);
+        // ... while a +10 offset at the same place means it has gone too far: it is not sent onward
+        CHECK(go_velocity(0, Ned{20, 0, -3}, Ned{0, 0, 0}, tgt, Ned{}, none, 10, floor_d, 25, 8, 0.5, 3, &start).n <= 1e-9);
+    }
     auto run = [](int mode, bool turning) {                                // 0 pursuit, 1 lead, 2 intercept, 3 PN
         Ned p{0, 0, -10}, v{0, 0, 0}, tp{40, -15, -10}; double th = kPi / 2, w = turning ? 0.25 : 0.0;
         Ned vprev{}; bool have = false; const double dt = 0.05;
@@ -2968,6 +3141,10 @@ public:
     }
     bool mode_pending() const { std::lock_guard<std::mutex> lk(mtx_); return pend_mode_; }
 
+// [GO-9] MAVLINK: how a GO reaches the flight controller. send_goto() starts it (position target + speed), the dash then
+// streams update_goto_velocity() (velocity + acceleration feed-forward, nose toward the target) or update_goto_point() (a
+// plain hold), cancel_goto() stops the resends, stop_point() is where the drone can brake to. Re-sent at the 20 Hz tick
+// until the pilot leaves GUIDED. See the GO map at the top of the file.
     // ---- go-to-target: a destination, kept alive by periodic resends until the pilot leaves GUIDED. No arrival/hold/release
     // logic here (see the fl:: go-to-target comment above RescueController).
     void send_goto(const fl::Ned& dest, double speed_ms, double yaw_rad) {
@@ -3957,7 +4134,8 @@ struct Args {
     // above RescueController. Disabled unless --enable-rescue; the trigger can be a QGC channel (RC override) and/or a physical
     // RC switch -- both map to the same channel below, so either works.
     bool enable_rescue = false;
-    double rescue_speed = 5.0, rescue_max_range = 150.0;
+    double rescue_speed = go_settings::kSpeed, rescue_max_range = 150.0;   // GO speed: edit go_settings::kSpeed (top of file)
+    bool go_confirm = false;               // --go-confirm: GO needs two presses (arm, then confirm within 3 s); default one press
     // How far above the target's estimated surface to stop (NOT 0): the raw geometry puts the destination AT the target's
     // own ground level, which for a real person/car/drone/anything the officer can select is a direct collision course, not
     // a rescue. 3 m is a starting point, not a measured safe distance -- tune per payload/prop clearance before real flights.
@@ -3968,8 +4146,8 @@ struct Args {
     bool goto_paced = false;               // --goto-paced: the old GO (one paced line to the point at confirm time, ends --rescue-hover-height above, then holds)
     bool lost_loiter = false;              // target lost while following: switch to LOITER (old behaviour) instead of hovering in place
     double abort_climb = 10.0;             // ABORT: climb this many metres straight up from where the drone is (--abort-climb)
-    double goto_accel = 4.0;               // GO pursuit: m/s^2 the moving reference speeds up / slows down with (--goto-accel)
-    double goto_standoff = 0.0;            // GO: stop this many metres short of the target's current position (0 = at the target; --rescue-standoff)
+    double goto_accel = go_settings::kAccel;   // GO braking / speed-up, m/s^2 (--goto-accel; edit go_settings::kAccel)
+    double goto_standoff = go_settings::kStopOffset;   // GO stop offset, m: + before the target, 0 at it, - past it (--go-offset; edit go_settings::kStopOffset)
     double rescue_decel = 2.0;             // m/s^2: dash pacing tapers to a stop over the last metres (0 = constant speed to the end)
     bool rescue_lead = false;              // aim the dash where the target will be (estimated velocity x flight time), opt-in
     double rescue_max_lead = 20.0;         // m: cap on that lead offset
@@ -4000,8 +4178,8 @@ struct Args {
     // real QGC path and compare the displayed time against the wall clock at the moment of the tap.
     double tap_latency_ms = 300.0;
     // 0 = off; a real 3-position switch (ArduPilot RCx_OPTION-style low/mid/high, same PWM thresholds as
-    // rc-high-thresh/rc-low-thresh): low=idle/abort, low->mid=arm (1st press), mid->high=confirm (2nd press),
-    // ANY zone -> low = abort. A 2-position switch cannot do this (there is no separate confirm zone to hold).
+    // rc-high-thresh/rc-low-thresh): any move UP = GO (one press), back to low during a dash = stop (BRAKE). With --go-confirm:
+    // low->mid = arm (1st press), mid->high = confirm (2nd press) -- a 2-position switch cannot do that (no separate confirm zone).
     int rc_rescue_channel = 0;
     bool rescue_descend = true;                                            // true (default, per the user): fly a direct 3D line to the target's real altitude (ground, or --target-height above it); false: --rescue-level-only keeps the current altitude instead
 };
@@ -4021,8 +4199,22 @@ std::string arg_value(int argc, char** argv, int& i) {
 //   real-c12-gimbal  real-c12, following the C12 gimbal angles (enable only after the bench tests listed in docs/RESCUE.md, "Known open items")
 // Any explicit option on the command line overrides the profile.
 // ---------------------------------------------------------------------
+// FPV airframe (--profile sim-fpv / real-fpv): camera FIXED to the airframe, and FPV speed. Matched to simulation/fpv.parm
+// (ArduPilot: 30 m/s, 15 m/s^2, 60 deg lean): the tracker's own ceilings must not be the bottleneck, nor ArduPilot's.
+//   Camera tilt -15 deg (+ up): an FPV airframe leans 40-60 deg at speed and the camera leans with it; at -30 a 50 deg lean pointed
+//   it 80 deg down and a target ahead left the top of the view. At -15 a target ~40 deg down stays in view from a hover (25 deg below
+//   the centre) to a ~45 deg lean (20 deg above it). The vertical loop holds the depression at lock, not the image centre.
+//   REAL aircraft: these are the airframe's limits to choose deliberately (and to match in ArduPilot), not the simulator's.
+inline void apply_fpv_flight(Args& a) {
+    a.camera_mount = "body"; a.cam_pitch_deg = -15.0; a.vz_mode = "center";
+    a.ceil_vx = 30.0; a.ceil_vy = 15.0; a.ceil_vz = 8.0; a.ceil_yaw = 3.0;      // follow (the 30 m/s sanity bound is the top)
+    // GO speed / braking / stop offset: NOT set here -- the go_settings block at the top of the file is the one place for them
+    a.speed_match_accel = 8.0; a.view_approach_speed = 6.0;                    // keep pace with / close on a fast target
+    a.fpv_speed = 28.0; a.fpv_accel = 6.0; a.fpv_approach = 8.0;               // --fpv chase
+}
+
 void apply_profile(Args& a, const std::string& p) {
-    if (p == "sim" || p == "sim-gimbal" || p == "sim-c12cam") {
+    if (p == "sim" || p == "sim-gimbal" || p == "sim-c12cam" || p == "sim-fpv") {
         // simulation/sim_up.sh's video relay ALWAYS sends a local copy to 127.0.0.1:5601 (a local copy for the tracker and recordings),
         // regardless of --video-to (which only controls the separate remote-Jetson leg) -- 5601 is therefore the port that
         // actually has a stream on it for a local-only test, not 5600 or any other number.
@@ -4063,6 +4255,20 @@ void apply_profile(Args& a, const std::string& p) {
                                  // FPV-fast follow: keep pace with an 18 m/s vehicle, turn up to 2 rad/s, close a distance error at 4 m/s
                                  a.ceil_vx = 18.0; a.ceil_vy = 10.0; a.ceil_yaw = 2.0; a.speed_match_accel = 3.5; a.view_approach_speed = 3.0; }
                                  // (6 m/s^2 tilted the drone ~31 deg per change, and the body-coupled camera lost the target: measured)
+        // sim_up.sh --fpv-camera: an FPV drone -- the same 1280x720 ~100 deg camera, but FIXED to the airframe, tilted --cam-pitch-deg
+        // (sim_up.sh FPV_CAM_PITCH, default -15) and no gimbal: the drone itself turns to centre the target sideways and climbs /
+        // descends to hold it vertically (on the depression below the horizon: fl::body_cam_vertical_error), at FPV speed
+        if (p == "sim-fpv") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.video_latency = 0.2;
+                              a.gimbal_centre = false; a.yaw_ff_mode = "world"; a.kyaw = 3.0; a.zoom_max = 1.0;
+                              apply_fpv_flight(a); }
+    } else if (p == "real-fpv") {
+        // the real FPV drone: camera fixed to the airframe (no gimbal, no C12). MEASURE the mount's tilt on the airframe and pass it
+        // (--cam-pitch-deg, + up, negative looks down) and the lens's --hfov-deg: every centring and ground estimate depends on them.
+        // Video defaults to a USB capture (/dev/video0, --source); --camera-source csi|rtsp|gst for other links.
+        a.connection = "serial:/dev/serial0:921600"; a.camera_source = "usb"; a.source = "0";   // the capture device on the companion
+        a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_component = true; a.cam_w = 1280; a.cam_h = 720; a.cam_fps = 30; a.cam_video_uri = "udp://0.0.0.0:5600";
+        a.no_display = true; a.yaw_ff_mode = "world";
+        apply_fpv_flight(a);
     } else if (p == "real-c12" || p == "real-c12-gimbal") {
         a.connection = "serial:/dev/serial0:921600"; a.camera_source = "rtsp"; a.rtsp_url = "rtsp://192.168.144.108:554/stream=1"; a.rtsp_latency = 50;
         a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_component = true; a.cam_w = 1280; a.cam_h = 720; a.cam_fps = 30; a.cam_video_uri = "udp://0.0.0.0:5600";
@@ -4070,7 +4276,7 @@ void apply_profile(Args& a, const std::string& p) {
         a.camera_mount = "gimbal"; a.vz_mode = "hold";   // the C12 is a stabilized gimbal; altitude stays the pilot's (see Args::vz_mode)
         if (p == "real-c12-gimbal") a.follow_source = "gimbal";
     } else {
-        throw std::runtime_error("unknown --profile '" + p + "' (sim | sim-gimbal | sim-c12cam | real-c12 | real-c12-gimbal)");
+        throw std::runtime_error("unknown --profile '" + p + "' (sim | sim-gimbal | sim-c12cam | sim-fpv | real-fpv | real-c12 | real-c12-gimbal)");
     }
 }
 
@@ -4153,8 +4359,6 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--gimbal-follow-prediction") a.gimbal_follow_prediction = true;
         else if (k == "--detector-port") a.detector_port = std::stoi(arg_value(argc, argv, i));
         else if (k == "--no-refine-lock") a.refine_lock = false;
-        else if (k == "--sam-refine" || k == "--seg-mode" || k == "--seg-min-score" || k == "--seg-max-latency" || k == "--detector-hz" || k == "--sam-model")
-            throw std::runtime_error(k + ": removed (EdgeSAM / detector paths were never used -- the lock box is the ground-colour model + GrabCut)");
         else if (k == "--lock-without-guided") a.lock_without_guided = true;
         else if (k == "--best-view") a.best_view = true;
         else if (k == "--best-view-min-frac") a.best_view_min_frac = std::stod(arg_value(argc, argv, i));
@@ -4181,7 +4385,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--c12-height") a.c12_h = std::stoi(arg_value(argc, argv, i));
         else if (k == "--rc-centerlock-channel") a.rc_centerlock_channel = std::stoi(arg_value(argc, argv, i));
         else if (k == "--enable-rescue") a.enable_rescue = true;
-        else if (k == "--rescue-speed") a.rescue_speed = std::stod(arg_value(argc, argv, i));
+        else if (k == "--rescue-speed" || k == "--go-speed") a.rescue_speed = std::clamp(std::stod(arg_value(argc, argv, i)), 0.5, go_settings::kMaxSpeed);
+        else if (k == "--go-confirm") a.go_confirm = true;
         else if (k == "--rescue-max-range") a.rescue_max_range = std::stod(arg_value(argc, argv, i));
         else if (k == "--rescue-hover-height") a.rescue_hover_height = std::stod(arg_value(argc, argv, i));
         else if (k == "--height-source") a.height_source = arg_value(argc, argv, i);
@@ -4190,7 +4395,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--lost-loiter") a.lost_loiter = true;
         else if (k == "--abort-climb") a.abort_climb = std::clamp(std::stod(arg_value(argc, argv, i)), 0.0, 100.0);
         else if (k == "--goto-accel") a.goto_accel = std::clamp(std::stod(arg_value(argc, argv, i)), 0.5, 10.0);
-        else if (k == "--goto-standoff" || k == "--rescue-standoff") a.goto_standoff = std::clamp(std::stod(arg_value(argc, argv, i)), 0.0, 50.0);
+        else if (k == "--go-offset" || k == "--goto-standoff" || k == "--rescue-standoff")   // + before the target, - past it (m)
+            a.goto_standoff = std::clamp(std::stod(arg_value(argc, argv, i)), -go_settings::kMaxOffset, go_settings::kMaxOffset);
         else if (k == "--rescue-decel") a.rescue_decel = std::stod(arg_value(argc, argv, i));
         else if (k == "--rescue-lead") a.rescue_lead = true;
         else if (k == "--rescue-max-lead") a.rescue_max_lead = std::stod(arg_value(argc, argv, i));
@@ -4210,7 +4416,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--fpv-lateral") a.fpv_lateral = true;
         else if (k == "--fpv-approach") a.fpv_approach = std::clamp(std::stod(arg_value(argc, argv, i)), 0.5, 20.0);
         else if (k == "--fpv-yaw-ff") a.fpv_yaw_ff = std::clamp(std::stod(arg_value(argc, argv, i)), 0.0, 1.0);
-        else if (k == "--fpv-speed") a.fpv_speed = std::clamp(std::stod(arg_value(argc, argv, i)), 1.0, 25.0);
+        else if (k == "--fpv-speed") a.fpv_speed = std::clamp(std::stod(arg_value(argc, argv, i)), 1.0, 30.0);
         else if (k == "--fpv-standoff") a.fpv_standoff = std::clamp(std::stod(arg_value(argc, argv, i)), 3.0, 60.0);
         else if (k == "--fpv-gain") a.fpv_k = std::clamp(std::stod(arg_value(argc, argv, i)), 0.05, 2.0);
         else if (k == "--fpv-ff") a.fpv_ff = std::clamp(std::stod(arg_value(argc, argv, i)), 0.0, 1.0);
@@ -4561,12 +4767,14 @@ private:
 //   * re-acquired after two consistent matches in a row -> CSRT is re-initialised there
 // Same footage after the change: 88% success, re-acquired after 3/3 occlusions. How long it may stay hidden before the lock is
 // declared LOST is the follow state machine's --lost-after.
+// [GO-7] ARRIVAL HOOK (see the GO map at the top of the file; arrival is detected in the dash loop [GO-6]).
 // ==== GO arrival hook ======================================================================================================
-// Called ONCE when a GO arrives (--rescue-standoff / go_standoff metres from the target's current position, at least --alt-floor
+// Called ONCE when a GO arrives at its stop point (the signed offset go_standoff from the target's current position: + before it,
+// - past it -- go_settings::kStopOffset / --go-offset / "go SPEED OFFSET"; at least --alt-floor
 // above its ground). The pursuit keeps holding that point (re-aimed at the target) until ABORT, a new lock, the target being gone
 // for 3 s, or the pilot's mode change. Put the operator's own landing / release / next step here -- deliberately left empty.
 //   link: the MAVLink link (send_goto / update_goto_point / send_mode_change / cancel_goto ...); veh: vehicle position (NED, m);
-//   target: the target's estimated position (NED, m); standoff_m: the stop distance in force.
+//   target: the target's estimated position (NED, m); standoff_m: the signed offset in force (+ before, - past the target).
 template <class Link> void on_go_arrived(Link& link, const fl::Ned& veh, const fl::Ned& target, double standoff_m) {
     (void)link; (void)veh; (void)target; (void)standoff_m;
 }
@@ -4585,7 +4793,7 @@ public:
         gallery_.clear(); reid_pending_ = 0; reid_next_ = 0; frame_n_ = 0; verify_pending_ = 0; verify_bad_ = 0; verify_next_ = 0;
         reanchor_run_ = 0; last_jump_frame_ = -1000; verify_ok_ = false; return true;
     }
-    bool reinit(const cv::Mat& f, const fl::Box& b) {                   // a new box for the SAME object (detector / segmenter)
+    bool reinit(const cv::Mat& f, const fl::Box& b) {                   // a new box for the SAME object (re-anchor / re-acquisition)
         pick_scale(b);
         if (!engine_.init(f, b)) return false;
         clear_state(b); csrt_w_ = b.w; return true;
@@ -4603,7 +4811,7 @@ public:
     // the image is being disturbed (gimbal move, zoom change, hard pitch / turn); on its END the identity check runs immediately
     void set_disturbed(bool d) { if (disturbed_ && !d) verify_next_ = 0; disturbed_ = d; }
     // the image filter's gate radius around this frame's prediction, for the hidden-target search (0 = off)
-    void set_reacq_gate(double r) { static const bool off = std::getenv("KF_NO_GATE") != nullptr; reacq_gate_ = off ? 0 : r; }
+    void set_reacq_gate(double r) { reacq_gate_ = r; }
     void set_reid(Reid r) { reid_ = std::move(r); have_reid_ = (bool)reid_.sync; }
     size_t reid_gallery() const { return gallery_.size(); }
     // similarity of each box to the gallery (max cosine); false when there is no gallery or a fingerprint failed / was late. After a
@@ -4659,8 +4867,6 @@ public:
     // pred: the Kalman prediction for this frame (already advanced); plausible: the caller's jump/size gate for a candidate box
     Step step(const cv::Mat& f, const fl::Box& pred, const std::function<bool(const fl::Box&)>& plausible) {
         frame_n_++;
-        static const bool legacy = std::getenv("TRK_LEGACY") != nullptr;   // A/B: the occlusion logic before the crossing guard
-        if (legacy) return step_legacy(f, pred, plausible);
         Step st;
         fl::Box path = pred;                                              // where the target should be (see the crossing guard)
         if (!occluded_) {
@@ -4683,9 +4889,8 @@ public:
                 const double sz = std::max(path.w, path.h);
                 if (geom && std::hypot(st.raw.cx() - path.cx(), st.raw.cy() - path.cy()) > std::max(3.0, 0.3 * sz)) {
                     // off the frozen straight path -- but the IMM prediction (which follows turns) agrees closely: the target TURNED, keep
-                    // it (measured on an identical-twin clip: rejecting it here sent the search to the twin). CROSS_IMM=0: off (A/B).
-                    static const bool imm_ok_on = !std::getenv("CROSS_IMM") || std::atoi(std::getenv("CROSS_IMM")) != 0;
-                    const bool imm_agrees = imm_ok_on && reacq_gate_ > 0 && pred.valid() &&
+                    // it (measured on an identical-twin clip: rejecting it here sent the search to the twin).
+                    const bool imm_agrees = reacq_gate_ > 0 && pred.valid() &&
                                             std::hypot(st.raw.cx() - pred.cx(), st.raw.cy() - pred.cy()) <= 0.35 * sz &&
                                             std::hypot(st.raw.cx() - path.cx(), st.raw.cy() - path.cy()) <= 1.0 * sz;
                     if (!imm_agrees) geom = false;
@@ -4713,10 +4918,6 @@ public:
                 // 44% -> 91% tracked and 1 -> 0 LOST without it, no change elsewhere, and the car-over-target self-test still passes.
                 // Learning stays on every accepted frame (it is already gated by the appearance score): NOT learning on low-contrast
                 // frames was measured too -- the model then never caught up with the shrinking target and the same start was lost.
-                static const bool old_hold = std::getenv("TRK_OLD_HOLD") != nullptr;   // A/B: the previous size hold
-                if (good_w_ <= 0) { good_w_ = st.raw.w; good_h_ = st.raw.h; }
-                if (old_hold && !clear) { st.box = fl::Box{st.raw.cx() - good_w_ / 2, st.raw.cy() - good_h_ / 2, good_w_, good_h_}; size_held_ = true; }
-                else { good_w_ = st.raw.w; good_h_ = st.raw.h; size_held_ = false; }
                 ap_.learn(f, st.box, st.score);
                 seen(st.box);
                 reanchor_run_ = 0;                                            // a real measurement
@@ -4827,33 +5028,6 @@ public:
         }
         return st;
     }
-    Step step_legacy(const cv::Mat& f, const fl::Box& pred, const std::function<bool(const fl::Box&)>& plausible) {
-        Step st;
-        if (!occluded_) {
-            st.raw_ok = engine_.update(f, st.raw);
-            st.score = st.raw_ok ? ap_.score(f, st.raw) : 0.0;
-            const bool geom = st.raw_ok && plausible(st.raw);
-            if (geom && ap_.accepts(st.score)) { bad_ = 0; ap_.learn(f, st.raw, st.score); st.accepted = true; st.box = st.raw; return st; }
-            if (pred.valid() && pred.x >= 0 && pred.y >= 0 && pred.x + pred.w <= f.cols && pred.y + pred.h <= f.rows) {
-                const double ps = ap_.score(f, pred);
-                if (ap_.accepts(ps) && engine_.init(f, pred)) { bad_ = 0; st.accepted = true; st.box = pred; st.score = ps; st.reanchored = true; return st; }
-            }
-            if (++bad_ < 2) return st;
-            occluded_ = true; coast_ = 0; have_cand_ = false;
-        }
-        st.occluded = true; coast_++;
-        fl::Box c; double sc = 0;
-        if (ap_.search(f, pred, coast_, c, sc) && ap_.reacquires(sc) && c.valid() && pred.valid()) {
-            if (have_cand_ && fl::iou(c, cand_) > 0.3) {
-                if (engine_.init(f, c)) {
-                    occluded_ = false; bad_ = 0; have_cand_ = false; coast_ = 0;
-                    st.accepted = true; st.reacquired = true; st.occluded = false; st.box = c; st.score = sc; return st;
-                }
-            }
-            cand_ = c; have_cand_ = true;
-        } else have_cand_ = false;
-        return st;
-    }
 private:
     static constexpr int kCalm = 8;                                       // frames without a lookalike before the crossing guard ends
     fl::Box crowd_path() const { return fl::Box{c0_.x + cvx_ * cn_, c0_.y + cvy_ * cn_, c0_.w, c0_.h}; }
@@ -4891,7 +5065,6 @@ private:
     }
     void clear_state(const fl::Box& b) {
         occluded_ = false; bad_ = 0; coast_ = 0; have_cand_ = false; streak_ = 0; vx_ = vy_ = 0; hist_.clear(); crowd_ = false; calm_ = cn_ = 0;
-        good_w_ = b.valid() ? b.w : 0; good_h_ = b.valid() ? b.h : 0; size_held_ = false;
         last_ = b; if (b.valid()) hist_.push_back(b);
     }
     static constexpr double kReidMin = 0.5, kReidW = 1.0, kVerifyMin = 0.45, kReidAccept = 0.6;
@@ -4923,7 +5096,6 @@ private:
     TrackerEngine engine_; fl::Appearance ap_;
     bool occluded_ = false; int bad_ = 0, coast_ = 0, streak_ = 0; bool have_cand_ = false; fl::Box cand_, last_;
     std::vector<fl::Box> hist_; double vx_ = 0, vy_ = 0; double csrt_w_ = 0;   // the box width CSRT was last started with
-    double good_w_ = 0, good_h_ = 0; bool size_held_ = false;          // the size from the last clearly visible frame
     double lock_contrast_ = 0;                                          // how much the locked box stood out from its surroundings
     bool crowd_ = false; int calm_ = 0, cn_ = 0; fl::Box c0_; double cvx_ = 0, cvy_ = 0;   // crossing guard: the path when it began
 };
@@ -4934,14 +5106,12 @@ private:
 //   target_tracker --replay VIDEO X Y FRAME [TRACK_SCALE] > out.csv
 // clicks (X, Y) on frame FRAME (0-based) through the real click-lock path, then runs exactly the live tracking core on every
 // following frame -- camera-motion compensation, Kalman prediction, LockTracker (CSRT + appearance + occlusion search) -- and
-// prints "n,state,x,y,w,h" per frame (state: 0 tracked, 1 doubtful, 2 hidden/searching, 3 lost after 2.5 s). TRK_LEGACY=1 runs the
-// occlusion logic from before the crossing guard, for A/B on the same frames.
+// prints "n,state,x,y,w,h" per frame (state: 0 tracked, 1 doubtful, 2 hidden/searching, 3 lost after 2.5 s).
 int run_replay(int argc, char** argv) {
     cv::VideoCapture cap(argv[2]);
     if (!cap.isOpened()) { std::fprintf(stderr, "cannot open %s\n", argv[2]); return 2; }
     const double cx = std::atof(argv[3]), cy = std::atof(argv[4]); const int f0 = std::atoi(argv[5]);
     const double scale = argc >= 7 ? std::atof(argv[6]) : 0.5;
-    const bool legacy = std::getenv("TRK_LEGACY") != nullptr;
     double fps = cap.get(cv::CAP_PROP_FPS); if (!(fps > 1 && fps < 200)) fps = 20;
     const int lost_frames = (int)std::lround(2.5 * fps);
     const double pad = std::getenv("CSRT_PAD") ? std::atof(std::getenv("CSRT_PAD")) : 3.0, tf = std::getenv("CSRT_TF") ? std::atof(std::getenv("CSRT_TF")) : 2.5;
@@ -4967,7 +5137,7 @@ int run_replay(int argc, char** argv) {
             continue;
         }
         if (!tracking) { std::printf("%d,3,0,0,0,0\n", n); continue; }
-        if (!A.empty()) { kf.warp(A); if (!legacy) lt.warp(A); }
+        if (!A.empty()) { kf.warp(A); lt.warp(A); }
         kf.predict(1.0);
         const fl::Box pred = kf.box();
         auto plausible = [&](const fl::Box& b) { return fl::box_plausible(pred, b, f.cols, f.rows, fl::PlausCfg(), 1.0) && fl::filter_gate(kf, pred, b); };
@@ -4975,7 +5145,7 @@ int run_replay(int argc, char** argv) {
         const LockTracker::Step ls = lt.step(f, pred, plausible);
         int state;
         if (ls.accepted) {
-            if (ls.reacquired && !legacy) kf.reset(ls.box); else if (!ls.reanchored) kf.update(ls.box); else kf.damp_velocity(0.97);
+            if (ls.reacquired) kf.reset(ls.box); else if (!ls.reanchored) kf.update(ls.box); else kf.damp_velocity(0.97);
             hidden = 0; state = 0;
         } else {
             kf.damp_velocity(ls.occluded ? 0.97 : 0.9);
@@ -5444,7 +5614,7 @@ int run_tracker_mode() {
     auto gimbal_record = [&](double t) { gimbal_hist.emplace_back(t, gimbal_cmd_pitch); while (gimbal_hist.size() > 64) gimbal_hist.pop_front(); };
     fl::Gains G; G.klat = args.klat; G.kyaw = args.kyaw; G.kz = args.kz; G.kx = args.kx; G.db_yaw = args.db_yaw; G.db_z = args.db_z; G.db_x = args.db_x; G.min_depression_deg = args.min_depression_deg;
     fl::FollowFsm fsm(fl::FsmTimes{args.coast_after, args.lost_after, args.unlock_after, args.link_hb_timeout_s});
-    fl::RescueCfg rcfg; rcfg.enabled = args.enable_rescue; rcfg.speed_ms = args.rescue_speed; rcfg.max_range_m = args.rescue_max_range; rcfg.min_battery_pct = args.rescue_min_battery;
+    fl::RescueCfg rcfg; rcfg.enabled = args.enable_rescue; rcfg.confirm = args.go_confirm; rcfg.speed_ms = args.rescue_speed; rcfg.max_range_m = args.rescue_max_range; rcfg.min_battery_pct = args.rescue_min_battery;
     fl::RescueController rescue(rcfg);
     int rc_rescue_zone = -1;   // -1 = no RC reading yet (0/1/2 = low/mid/high once seen)
     if (rcfg.enabled) std::printf("[RESCUE] ENABLED: go-to-target at %.1f m/s, max range %.0f m (press g, confirm within 3 s, or x to abort)\n", rcfg.speed_ms, rcfg.max_range_m);
@@ -5488,7 +5658,7 @@ int run_tracker_mode() {
         try { det = std::make_unique<DetectorLink>(args.detector_port); }
         catch (const std::exception& e) { std::fprintf(stderr, "[DETECT] disabled: %s\n", e.what()); }
     }
-    AiBackend* ai = native_ai ? native_ai.get() : static_cast<AiBackend*>(det.get());   // segmentation + ReID, whichever serves them
+    AiBackend* ai = native_ai ? native_ai.get() : static_cast<AiBackend*>(det.get());   // ReID, whichever serves it
     if (args.reid && !ai) std::fprintf(stderr, "[REID] needs the in-process models or the sidecar link: ReID off\n");
     if (args.reid && ai) {
         AiBackend* d = ai;
@@ -5505,7 +5675,9 @@ int run_tracker_mode() {
     double cam_prev_gimbal = 0, cam_prev_t = -1, cam_prev_yaw = 0; bool cam_prev_have_yaw = false;   // camera-motion fallback (see below)
     fl::Cmd chase_last; double chase_last_t = -1e9;   // the last chase command, faded out if the estimate drops out
     double zoom_changed_at = -1e9;        // last digital zoom change (s)
-    double go_speed_req = 0, go_standoff_req = -1;   // per-GO overrides (QGC GO param1/param2, stdin "go S D"); 0 / -1 = configured
+    // per-GO overrides (stdin "go SPEED OFFSET", QGC GO param1/param2): go_speed_req 0 = the configured speed, go_standoff_req NaN =
+    // the configured offset (signed: + before the target, - past it). Spent by the GO that uses them.
+    double go_speed_req = 0, go_standoff_req = std::numeric_limits<double>::quiet_NaN();
     double go_speed = 0, go_standoff = 0, go_prev_range = 0, go_togo = 0;            // in force for the current GO
     double abort_flash_until = 0;         // on-screen "ABORTED" banner
     double chase_vn = 0, chase_ve = 0;   // smoothed target velocity for the chase feed-forward
@@ -5559,6 +5731,7 @@ int run_tracker_mode() {
     std::future<fl::LockJob> lock_job; bool lock_job_running = false; bool pending_preseg = false; cv::Point2d click_rel(-1, -1); double lock_t = -1e9;
     auto select_rect = [&](const fl::Box& b, double t) { pending_box = b; pending_point = false; pending_preseg = false; pending_since = t; ++lock_gen; };       // select received, waiting for GUIDED
     fl::Box box;                                                         // last ACCEPTED tracker box (full-frame px)
+    double lock_dep = std::numeric_limits<double>::quiet_NaN();           // FPV (fixed camera): the target's depression at lock
     double last_accept = now_s(), ref_h = 0, last_reject_log = 0; bool tracking = false; std::vector<double> settle;
     cv::Scalar ref_color(-1, -1, -1);   // mean BGR of the box at lock time, for the appearance cross-check (fl::color_plausible)
     bool rc_lock_armed = true, prev_session = false, goto_sent = false;   // goto_sent: once a go-to fires, the normal follow-velocity
@@ -5726,6 +5899,9 @@ int run_tracker_mode() {
         const bool video_stalled = fl::FrameGap::stalled(frame_gap);
         const VehicleState vs = link->state();
 
+        // [GO-1] INPUT: every GO source below sets `rescue_press` (one press = GO; --go-confirm: arm, then confirm -- see [GO-2]); "go SPEED DIST" / QGC
+        // param1/param2 set this GO's speed and stop distance (go_speed_req / go_standoff_req); 'x' / "abort" / QGC ABORT set the
+        // ABORT handled in [GO-8].
         // ---- operator inputs: window keys/drag, stdin, QGC, RC ----
         bool want_unlock = false, quit = false, rescue_press = false, rescue_abort = false, want_quick_lock = false;
         bool hard_abort = false;   // an EXPLICIT abort (button, key, QGC, command) -- stops whatever the drone is doing (not the RC switch's reset)
@@ -5735,10 +5911,12 @@ int run_tracker_mode() {
             else if (std::sscanf(cmd.c_str(), "click %lf %lf", &a, &b) == 2) select_point(a, b, now);
             else if (cmd == "unlock") want_unlock = true;
             else if (cmd == "go") rescue_press = true;
-            else if (std::sscanf(cmd.c_str(), "go %lf %lf", &a, &b) == 2) {   // go SPEED STOP_DISTANCE (for this GO; 0 = at the target)
-                rescue_press = true; if (a > 0) go_speed_req = std::min(a, 30.0); if (b >= 0) go_standoff_req = std::min(b, 50.0);
+            else if (std::sscanf(cmd.c_str(), "go %lf %lf", &a, &b) == 2) {   // go SPEED OFFSET, this GO only: "go 15 -10" = 15 m/s, 10 m PAST
+                rescue_press = true;                                            // (OFFSET + before the target, 0 at it, - past it; SPEED 0 = configured)
+                if (a > 0) go_speed_req = std::min(a, go_settings::kMaxSpeed);
+                if (std::isfinite(b)) go_standoff_req = std::clamp(b, -go_settings::kMaxOffset, go_settings::kMaxOffset);
             }
-            else if (std::sscanf(cmd.c_str(), "go %lf", &a) == 1) { rescue_press = true; if (a > 0) go_speed_req = std::min(a, 30.0); }
+            else if (std::sscanf(cmd.c_str(), "go %lf", &a) == 1) { rescue_press = true; if (a > 0) go_speed_req = std::min(a, go_settings::kMaxSpeed); }
             else if (cmd == "abort") rescue_abort = hard_abort = true;
             else if (cmd == "quit") quit = true;
             else if (cmd == "relock" || cmd == "lockc") want_quick_lock = true;
@@ -5791,9 +5969,9 @@ int run_tracker_mode() {
         double op_p1 = 0, op_p2 = 0;
         while (link->poll_op_request(op, &op_p1, &op_p2)) {                // QGC Custom Action / joystick button (MAV_CMD_USER_1..4)
             switch (op) {
-                case OpCmd::PRESS: rescue_press = true;                     // param1 = GO speed (m/s), param2 = stop distance (m); <= 0: configured
-                    if (op_p1 > 0) go_speed_req = std::min(op_p1, 30.0);
-                    if (op_p2 > 0) go_standoff_req = std::min(op_p2, 50.0);
+                case OpCmd::PRESS: rescue_press = true;                     // param1 = GO speed (m/s), param2 = offset (m, + before / - past); 0 = configured
+                    if (op_p1 > 0) go_speed_req = std::min(op_p1, go_settings::kMaxSpeed);
+                    if (op_p2 != 0 && std::isfinite(op_p2)) go_standoff_req = std::clamp(op_p2, -go_settings::kMaxOffset, go_settings::kMaxOffset);
                     break;
                 case OpCmd::ABORT: rescue_abort = hard_abort = true; break;
                 case OpCmd::UNLOCK: want_unlock = true; break;
@@ -5819,13 +5997,13 @@ int run_tracker_mode() {
             if (v > args.rc_high_thresh && rc_lock_armed) { select_point(W / 2.0, H / 2.0, now); rc_lock_armed = false; }
             else if (v > 0 && v < args.rc_low_thresh) { if (!rc_lock_armed) want_unlock = true; rc_lock_armed = true; }
         }
-        if (args.rc_rescue_channel > 0 && rc_fresh) {                           // 3-position switch: low=idle/abort, mid=arm, high=confirm
+        if (args.rc_rescue_channel > 0 && rc_fresh) {                           // rescue switch: up = GO, back to low = stop (see below)
             int v = vs.rc[std::min(args.rc_rescue_channel, 18)];
             if (v > 0) {
                 int zone = v < args.rc_low_thresh ? 0 : (v > args.rc_high_thresh ? 2 : 1);
                 if (rc_rescue_zone < 0) rc_rescue_zone = zone;                      // first reading: adopt it silently, no event
-                else if (zone > rc_rescue_zone) rescue_press = true;                // low->mid or mid->high: a press (arm, then confirm)
-                else if (zone == 0 && rc_rescue_zone != 0) rescue_abort = true;      // any zone -> low: abort/safe
+                else if (zone > rc_rescue_zone) rescue_press = true;                // any move UP: a press (one press = GO; --go-confirm: arm, then confirm)
+                else if (zone == 0 && rc_rescue_zone != 0) rescue_abort = true;      // back to low: stop -- BRAKE during a dash ([GO-8] 2/4)
                 rc_rescue_zone = zone;
             }
         }
@@ -5840,7 +6018,7 @@ int run_tracker_mode() {
             if (live.valid() && box.cx() >= live.x && box.cx() <= live.x + live.w && box.cy() >= live.y && box.cy() <= live.y + live.h &&
                 live.w * live.h >= box.w * box.h && live.x >= 0 && live.y >= 0 && live.x + live.w <= W && live.y + live.h <= H && lt.init(frame, live)) {
                 std::printf("[LOCK] completed to the whole object: %dx%d -> %dx%d (GrabCut)\n", (int)box.w, (int)box.h, (int)live.w, (int)live.h);
-                box = live; kf.reset(live); last_accept = now; ref_h = 0; have_ref = false; settle.clear(); view_ref_h = 0;
+                box = live; kf.reset(live); last_accept = now; ref_h = 0; lock_dep = std::numeric_limits<double>::quiet_NaN(); have_ref = false; settle.clear(); view_ref_h = 0;
             }
             complete_ready.reset();
         }
@@ -5907,7 +6085,7 @@ int run_tracker_mode() {
             (void)was_preseg; click_rel = cv::Point2d(-1, -1);
             if (!seg_ok) lock_request = false;
             else if (lt.init(frame, pb)) { box = pb; kf.reset(pb); last_accept = now; tracking = true; refit_last_w = refit_last_h = 0;
-                                          have_ref = false; ref_h = 0; settle.clear(); goto_sent = false;   // a fresh lock re-enables normal follow control
+                                          have_ref = false; ref_h = 0; lock_dep = std::numeric_limits<double>::quiet_NaN(); settle.clear(); goto_sent = false;   // a fresh lock re-enables normal follow control
                                           // A new lock supersedes any earlier dash: stop re-sending its position target (it would
                                           // otherwise fight the follow velocities at 1 Hz) and restart the velocity session, which
                                           // the dash ended -- the FSM may have stayed non-IDLE throughout, so the session-edge
@@ -6275,7 +6453,17 @@ int run_tracker_mode() {
             } else if (cam_known) {
                 const bool strafe = args.lateral_mode == "strafe";
                 const double hold_h = (args.auto_view && view_ref_h > 0) ? view_ref_h : (ref_h > 0 ? ref_h : kf.box().h);   // until settled: no forward/back
-                desired = fl::image_control(kf.box(), hold_h, K, G, lc.ceilings, strafe ? fl::deg2rad(cam_yaw) : yaw_offset_now, args.vz_mode == "center", strafe);
+                // camera fixed to the airframe (FPV, no gimbal): centre vertically on the depression below the horizon, not the
+                // image row -- see fl::body_cam_vertical_error (the attitude the frame was taken with, like the bearing above)
+                const bool fixed_cam = args.camera_mount == "body" && !args.gimbal_centre && !c12;
+                // the reference: the target's depression once the lock has settled (ref_h set), i.e. the framing the pilot locked
+                // with; until then none (error 0: hold the altitude)
+                if (ref_h <= 0) lock_dep = std::numeric_limits<double>::quiet_NaN();
+                else if (fixed_cam && !std::isfinite(lock_dep)) lock_dep = fl::body_cam_depression(cbox.cx() - K.cx, cbox.cy() - K.cy, K.fx, K.fy, cam_yaw, cam_pitch, ps.pitch, ps.roll);
+                const double vert_err = !fixed_cam ? std::numeric_limits<double>::quiet_NaN()
+                    : !std::isfinite(lock_dep) ? 0.0
+                    : fl::body_cam_vertical_error(cbox.cx() - K.cx, cbox.cy() - K.cy, K.fx, K.fy, cam_yaw, cam_pitch, ps.pitch, ps.roll, std::atan(K.cy / K.fy), lock_dep);
+                desired = fl::image_control(kf.box(), hold_h, K, G, lc.ceilings, strafe ? fl::deg2rad(cam_yaw) : yaw_offset_now, args.vz_mode == "center", strafe, vert_err);
                 // A turn the TRACKER can follow: the image may shift at most ~60% of the box width (>= 25 px) per frame. Measured: locks
                 // made with the target far off centre turned at 1.4-2 rad/s (~40-60 px a frame on a 25-50 px box) and were lost within
                 // seconds. Caps the CORRECTION only -- the target's own turn rate (feed-forward, added below) moves the scene WITH it.
@@ -6305,7 +6493,9 @@ int run_tracker_mode() {
                     vx_view *= std::clamp(1.0 - std::fabs(desired.yaw_rate) / std::max(0.1, lc.ceilings.yaw), 0.0, 1.0);   // turn first, then move
                     // no forward flight while the target sits near the top/bottom edge of the view: the camera (gimbal) has to catch
                     // up first, or flying on pushes the target out of the frame -- full speed when centred, none at 25 deg off
-                    const double verr = std::fabs(fl::rad2deg(std::atan((kf.box().cy() - K.cy) / K.fy)));
+                    // (camera fixed to the airframe: the attitude-corrected error -- pitched forward, the target sits high in the
+                    // frame by design, and the image row alone would stop the very forward flight that pitched it)
+                    const double verr = std::fabs(fl::rad2deg(fixed_cam ? vert_err : std::atan((kf.box().cy() - K.cy) / K.fy)));
                     if (vx_view > 0) vx_view *= std::clamp(1.0 - verr / 25.0, 0.0, 1.0);
                     // eased (~0.6 s), AFTER those factors (review: applied after easing, the instantaneous yaw undid the easing --
                     // every forward-speed jump > 0.8 m/s in a live log came with a yaw swing)
@@ -6457,6 +6647,8 @@ int run_tracker_mode() {
         if (los_dep > fl::deg2rad(70.0)) desired.vx = std::min(desired.vx, los_dep > fl::deg2rad(80.0) ? -0.5 : 0.0);
         link->command(desired, (fsm.steering_allowed() || coast_turn) && !goto_sent && !rescue_holding);
 
+        // [GO-10] CAMERA during the dash: gimbal drones only (--gimbal-centre). With a FIXED (FPV) camera this block never runs: the
+        // dash itself points the nose at the target (yaw_to in [GO-6]), which keeps the camera on it.
         // ---- GO: keep the target in the live view while the drone dives at it. The image-only gimbal loop below moves only on good
         // frames and at <= 25 deg/s; in a dash the target slid off the bottom of the view and the lock dropped (measured). During GO
         // the gimbal is aimed at the target's WORLD position (the pursuit's estimate, re-aimed every frame) -- the camera stays on it
@@ -6525,6 +6717,7 @@ int run_tracker_mode() {
         }
         st.control = (now_s() - t2) * 1000;
 
+        // [GO-8] STOPPING (1/4) -- ABORT: leave the target and climb, from a dash, a hold after GO, or plain following.
         // ---- ABORT (explicit: window button, 'x', QGC ABORT, stdin "abort"): LEAVE THE TARGET AND CLIMB -- whatever the drone is doing
         // (a GO dash, following, holding after a GO). The GO and the follow loop stop at once and the drone climbs straight up
         // --abort-climb metres (default 10, never above --alt-ceiling) from where it is, and holds there in GUIDED. Nothing of the
@@ -6554,6 +6747,14 @@ int run_tracker_mode() {
             say("ABORT: stopped (no position estimate for the climb -- take over with the sticks)", SEV_WARN, "ABORT: stopped, no position");
         } else if (hard_abort) say(vs.guided ? "ABORT: nothing to stop (not locked, no GO)" : "ABORT: not in GUIDED -- the pilot already has control", SEV_INFO, "-");
 
+        // =============================================================================================================================
+        // [GO-3] DESTINATION + [GO-2] ARM/CONFIRM + [GO-5] START + [GO-6] DASH LOOP + [GO-8] STOPPING -- the GO main-loop block.
+        //   1. dest = the target's ground position (live geometry fix, or its IMM-UKF track predicted to now), turned into the
+        //      end point by fl::pursuit_point: `standoff` short of it, never below --alt-floor above its ground.
+        //   2. RescueController.step(): the readiness gates, then ONE press sends GO (--go-confirm: arm -> preview to QGC -> confirm).
+        //   3. ro.send_goto -> the dash starts ([GO-5]); then every frame the dash loop ([GO-6]) re-aims and flies it.
+        // Skipped entirely without --enable-rescue. See the GO map at the top of the file.
+        // =============================================================================================================================
         // ---- go-to-target: destination from the current view, then the controller (arm/confirm -> ONE go-to command, no further handling) ----
         fl::RState rescue_state = fl::RState::DISABLED;
         bool marker_dest_ok = false; fl::Ned marker_dest{};
@@ -6594,7 +6795,9 @@ int run_tracker_mode() {
                     pursuit_tgt = dest;
                     const double floor_d = args.rescue_descend ? dest.d - std::max(0.0, args.alt_floor - args.target_height) : veh.d;
                     if (!args.rescue_descend) pursuit_tgt.d = veh.d;
-                    dest = fl::pursuit_point(veh, pursuit_tgt, go_standoff_req >= 0 ? go_standoff_req : args.goto_standoff, floor_d);
+                    // the stop point, signed offset (+ before / - past the target): this GO's override, else the configured one
+                    dest = fl::pursuit_point(veh, pursuit_tgt, std::isfinite(go_standoff_req) ? go_standoff_req : args.goto_standoff, floor_d,
+                                             goto_path_active ? &goto_start : nullptr);
                     pursuit_floor_d = floor_d;
                 } else {
                     if (dest_ok && args.rescue_descend) dest.d -= std::max(args.rescue_hover_height, args.alt_floor - args.target_height);
@@ -6623,11 +6826,14 @@ int run_tracker_mode() {
                     (ro.end != fl::REnd::NONE ? std::string(" (") + fl::to_str(ro.end) + (ro.detail.empty() ? "" : ": " + ro.detail) + ")" : ""),
                     ro.end != fl::REnd::NONE ? SEV_WARN : SEV_INFO,
                     ro.end != fl::REnd::NONE ? std::string("Rescue: ") + (ro.detail.empty() ? fl::to_str(ro.end) : ro.detail) : "");
+            // [GO-5] START: the confirm press went through -- fix this GO's speed / stop distance, take the drone from the follow
+            // loop (handover_session) and send the first go-to. From here `goto_path_active` drives the dash loop [GO-6] and
+            // `goto_sent` keeps the follow loop silent (no follow velocity, no LOITER-on-loss) until a new lock or ABORT.
             if (ro.send_goto) { abort_latched = false;
                 pursuit_last = pursuit_tgt; pursuit_seen = now; pursuit_arrived = false;
                 go_speed = go_speed_req > 0 ? go_speed_req : rcfg.speed_ms;      // this GO's speed and stop distance, then the overrides are spent
-                go_standoff = go_standoff_req >= 0 ? go_standoff_req : args.goto_standoff;
-                go_speed_req = 0; go_standoff_req = -1;
+                go_standoff = std::isfinite(go_standoff_req) ? go_standoff_req : args.goto_standoff;
+                go_speed_req = 0; go_standoff_req = std::numeric_limits<double>::quiet_NaN();
                 goto_start = ri.veh; goto_final = ro.dest; goto_along = 0; goto_prev_t = now; goto_path_active = true; override_hits = 0; go_have_prev_v = false; go_acc_f = fl::Ned{}; pursuit_static = false;
                 goto_total = std::sqrt(std::pow(goto_final.n - goto_start.n, 2) + std::pow(goto_final.e - goto_start.e, 2) + std::pow(goto_final.d - goto_start.d, 2));
                 link->send_goto(goto_start, args.goto_paced ? rcfg.speed_ms : go_speed, fl::bearing_to(goto_start, goto_final));   // activates the go-to at the current point
@@ -6637,8 +6843,9 @@ int run_tracker_mode() {
                 {
                     char gm[128];
                     if (args.goto_paced) std::snprintf(gm, sizeof gm, "GO-TO sent: %d m diagonal at %.0f m/s", (int)goto_total, rcfg.speed_ms);
-                    else if (go_standoff < 0.05) std::snprintf(gm, sizeof gm, "GO-TO sent: %d m straight at the target at %.1f m/s, to the target", (int)goto_total, go_speed);
-                    else std::snprintf(gm, sizeof gm, "GO-TO sent: %d m straight at the target at %.1f m/s, stopping %.1f m short", (int)goto_total, go_speed, go_standoff);
+                    else if (std::fabs(go_standoff) < 0.05) std::snprintf(gm, sizeof gm, "GO-TO sent: %d m straight at the target at %.1f m/s, to the target", (int)goto_total, go_speed);
+                    else if (go_standoff > 0) std::snprintf(gm, sizeof gm, "GO-TO sent: %d m straight at the target at %.1f m/s, stopping %.1f m BEFORE it", (int)goto_total, go_speed, go_standoff);
+                    else std::snprintf(gm, sizeof gm, "GO-TO sent: %d m at the target at %.1f m/s, stopping %.1f m PAST it", (int)goto_total, go_speed, -go_standoff);
                     say(gm);
                 }
             }
@@ -6649,6 +6856,7 @@ int run_tracker_mode() {
             // drops the lock on its own next tick, same as any other mode change away from GUIDED).
             // In flight, or still moving with the target after arrival (--rescue-stay-over). NOT a plain completed dash: the vehicle
             // is just holding there, and an RC rescue switch flicked back to low afterwards (its natural reset) must not BRAKE it.
+            // [GO-8] STOPPING (2/4) -- the RC rescue switch back to low during a dash: BRAKE mode (an explicit ABORT was handled in (1/4)).
             if ((goto_path_active || (goto_sent && args.rescue_stay_over)) && rescue_abort) {
                 link->update_goto_point(veh_now, vs.yaw);                 // no velocity left attached, whatever happens to the BRAKE
                 link->cancel_goto();
@@ -6669,6 +6877,7 @@ int run_tracker_mode() {
             // refinement. A single-frame gap between "what we just computed" and "what the FC last echoed back" is exactly
             // what that normal reporting lag looks like, not a second sender -- only a mismatch that PERSISTS across several
             // consecutive checks is actually consistent with something else also writing position targets.
+            // [GO-8] STOPPING (3/4) -- someone else (QGC "Go to location", Orbit, ROI) is commanding a position: back off.
             if (goto_path_active && link->goto_overridden(args.rescue_override_margin)) {
                 if (++override_hits >= 3) {
                     link->cancel_goto(false);                             // the other command has taken over: do not fight it
@@ -6678,6 +6887,11 @@ int run_tracker_mode() {
             } else {
                 override_hits = 0;
             }
+            // [GO-6] DASH LOOP (every frame while the dash runs):
+            //   T = where the target is now (live fix while LOCKED, else its track predicted <= 1.5 s, else the last point)
+            //   v = fl::go_velocity(...)  [GO-4]  -> + acceleration feed-forward -> link->update_goto_velocity(v, yaw_to)  [GO-9]
+            //   yaw_to points the nose at the target (with an FPV fixed camera this is what keeps it in view)
+            //   arrival within ~1 m -> on_go_arrived() [GO-7];  nothing seen for 3 s -> hold the last point [GO-8 (4/4)]
             if (goto_path_active && !args.goto_paced) {
                 // Pursuit: every frame, re-aim at where the target is NOW (locked: the live estimate; briefly hidden: the track predicted
                 // forward up to 1.5 s; longer: the last point) and let the autopilot fly the straight line to the end point at the GO
@@ -6686,8 +6900,11 @@ int run_tracker_mode() {
                 if (dest_ok && fsm.state() == fl::FState::LOCKED) { T = pursuit_tgt; fresh = true; }
                 else if (tgt_est.valid(now, 1.5)) { T = tgt_est.predict(now - tgt_est.last_fix()); if (!args.rescue_descend) T.d = veh_now.d; fresh = true; }
                 if (fresh) { pursuit_last = T; pursuit_seen = now; }
-                const fl::Ned E = fl::pursuit_point(veh_now, T, go_standoff, pursuit_floor_d);
-                const double yaw_to = std::hypot(T.n - veh_now.n, T.e - veh_now.e) > 1.0 ? fl::bearing_to(veh_now, T) : vs.yaw;
+                const fl::Ned E = fl::pursuit_point(veh_now, T, go_standoff, pursuit_floor_d, &goto_start);   // the stop point (signed offset)
+                // nose: at the target -- or, stopping PAST it (offset < 0), at the stop point: the same direction until the drone is over the
+                // target, but it does not whip round 180 deg as the drone flies over it
+                const fl::Ned& look = go_standoff < 0 ? E : T;
+                const double yaw_to = std::hypot(look.n - veh_now.n, look.e - veh_now.e) > 1.0 ? fl::bearing_to(veh_now, look) : vs.yaw;
                 const double v_now = std::sqrt(vs.vel[0] * vs.vel[0] + vs.vel[1] * vs.vel[1] + vs.vel[2] * vs.vel[2]);
                 // guidance (--go-guidance): against a MOVING target the approach is relative to it -- see fl::go_velocity. The target's
                 // velocity and its turn-aware future come from the IMM-UKF track; without a valid track: the previous pursuit law.
@@ -6695,7 +6912,7 @@ int run_tracker_mode() {
                 const fl::Ned vt = trk ? fl::Ned{tgt_est.vn(), tgt_est.ve(), 0.0} : fl::Ned{};
                 auto predict = [&](double t) { fl::Ned q = tgt_est.predict(now - tgt_est.last_fix() + t); q.d = T.d; return q; };
                 const fl::Ned vveh{vs.vel[0], vs.vel[1], vs.vel[2]};
-                fl::Ned v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, go_standoff, pursuit_floor_d, go_speed, args.goto_accel, 0.5, args.pn_gain);
+                fl::Ned v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, go_standoff, pursuit_floor_d, go_speed, args.goto_accel, 0.5, args.pn_gain, &goto_start);
                 // the height floor: no descending within (descent speed x 0.5 s) of it -- the end point already respects it
                 if (v.d > 0) v.d = std::min(v.d, std::max(0.0, (pursuit_floor_d - veh_now.d) / 0.5));
                 // acceleration feed-forward: how the commanded velocity is changing (PN's turn, the speed-up, the braking), smoothed and
@@ -6724,7 +6941,7 @@ int run_tracker_mode() {
                 const double vt_go = tgt_est.valid(now, 1.0) ? std::hypot(tgt_est.vn(), tgt_est.ve()) : 0.0;
                 if (!pursuit_arrived && togo < 1.0 + 0.5 * vt_go) {   // 1 m: the ground estimate's own accuracy up close (0.5 was never met live)
                     pursuit_arrived = true;
-                    char am[96]; std::snprintf(am, sizeof am, "GO-TO arrived: %.1f m from the target", go_standoff);
+                    char am[96]; std::snprintf(am, sizeof am, "GO-TO arrived: %.1f m %s the target", std::fabs(go_standoff), go_standoff >= 0 ? "before" : "past");
                     say(am, SEV_INFO, "GO-TO arrived");
                     on_go_arrived(*link, veh_now, T, go_standoff);        // the operator's own landing / next step (empty here)
                 } else if (pursuit_arrived && togo > 2.0) pursuit_arrived = false;   // it moved off: chasing again
@@ -6733,6 +6950,7 @@ int run_tracker_mode() {
                 // carries on to it -- a slower computer (Pi 4) loses the view in a fast dash more often, and a static rescue location must
                 // still be reached
                 if (fresh) pursuit_static = tgt_est.valid(now, 1.5) && std::hypot(tgt_est.vn(), tgt_est.ve()) < 0.5;
+                // [GO-8] STOPPING (4/4) -- target not seen for 3 s: hold the last point instead of flying after a stale guess.
                 if (now - pursuit_seen > 3.0 && !pursuit_static) {
                     // HOLD = a plain position target with NO velocity: ArduPilot keeps advancing a position+velocity setpoint by its
                     // velocity on its own -- measured in SITL: holding with the last (forward, downward) velocity still attached
@@ -6871,9 +7089,9 @@ int run_tracker_mode() {
                 char gos[64] = "";
                 if (goto_path_active) std::snprintf(gos, sizeof gos, "  [GO %.1f m/s, %.1f m to go%s]", go_speed, go_togo, pursuit_arrived ? ", ARRIVED" : "");
                 else if (goto_sent) std::snprintf(gos, sizeof gos, "  [HOLDING]");
-                std::snprintf(txt, sizeof txt, "SPEED %.1f m/s  climb %+.1f m/s  ALT %.1f m  %s  | GO %.0f m/s stop %.1f m  ABORT climb %.0f m%s",
+                std::snprintf(txt, sizeof txt, "SPEED %.1f m/s  climb %+.1f m/s  ALT %.1f m  %s  | GO %.0f m/s stop %+.1f m  ABORT climb %.0f m%s",
                               gs, vz, vs.alt_m, vs.guided ? "GUIDED" : "not GUIDED", go_speed_req > 0 ? go_speed_req : rcfg.speed_ms,
-                              go_standoff_req >= 0 ? go_standoff_req : args.goto_standoff, args.abort_climb, gos);
+                              std::isfinite(go_standoff_req) ? go_standoff_req : args.goto_standoff, args.abort_climb, gos);
                 cv::putText(vis, txt, {8, H - 12}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 2, cv::LINE_AA);
                 cv::putText(vis, txt, {8, H - 12}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {40, 40, 40}, 1, cv::LINE_AA);
             }

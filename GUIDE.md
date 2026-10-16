@@ -1,4 +1,4 @@
-# Rescue Drone Tracker: A Plain-Language Guide
+# FPV Tracking: A Plain-Language Guide
 
 This guide explains, without jargon, what this project does, what each part is for, and exactly what to type to use it.
 You do not need to know programming to follow it. Copy each command exactly as written.
@@ -7,13 +7,14 @@ You do not need to know programming to follow it. Copy each command exactly as w
 
 ## 1. What does this project do?
 
-A drone flies with a camera. On a screen you see what the camera sees.
+An FPV drone flies with a camera fixed to its frame. On a screen you see what the camera sees.
 
 1. **You click on something** in the picture (a person, a car, a boat, a box: anything).
 2. The program draws a **green box** around it. This is called **locking** onto the target.
-3. The drone **keeps the target in the middle of the picture**: it turns, tilts its camera and moves to follow it.
-4. When you press **GO** (twice), the drone **flies quickly to the target** and stops there (or a few metres before it, if you
-   ask). What happens next (landing, dropping a float, …) is your own code.
+3. The drone **keeps the target in view**: the camera cannot move on its own, so the drone itself turns, climbs and goes
+   down to follow it.
+4. When you press **GO** (once), the drone **flies quickly to the target** and stops there, or a few metres before or past
+   it if you ask (see section 8). What happens next (landing, dropping a float, …) is your own code.
 5. **ABORT** makes the drone leave the target and climb straight up to safety.
 6. If the target is lost, the drone **stops and hovers** where it is. It never flies off on its own.
 
@@ -44,23 +45,25 @@ click it.
 - **Flying to it with GO:** **Proportional Navigation (PN)**, the same principle interceptors use. The drone heads for where the
   target *will be*, not where it was, so it does not chase behind a moving target.
 
-**Not used (removed):** EdgeSAM, MobileSAM, FastSAM and YOLO. They were tried and never used, so they were deleted. Everything
-above works without them.
-
 ---
 
 ## 3. One-time setup (only the first time)
 
-Open a terminal and type:
+First install the programs it needs: see "Install and build" in [README.md](README.md) (one `apt` and one `pip`
+command, plus the simulator if you want to practise on the laptop). Then open a terminal and type:
 
 ```bash
-cd ~/drone-gazebo/tracker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+git clone https://github.com/maha-vidya/fpv-tracking.git ~/fpv-tracking
 ```
 
-This builds the program. It takes a few minutes. Then check it works:
+```bash
+cd ~/fpv-tracking/tracker && scripts/build.sh
+```
+
+This downloads the code and builds the program. It takes a few minutes. Then check it works:
 
 ```bash
-~/drone-gazebo/tracker/build/target_tracker --selftest
+~/fpv-tracking/tracker/build/target_tracker --selftest
 ```
 
 You should see `0 failed` at the end. If you see failures, stop and ask for help before flying.
@@ -74,15 +77,16 @@ Do these steps in order. Each one uses its own terminal window (open a new tab f
 **Step 1: start the pretend world.**
 
 ```bash
-cd ~/drone-gazebo/simulation && ./sim_up.sh --gimbal --c12-camera --fast --target moving
+cd ~/fpv-tracking/simulation && ./sim_up.sh --fpv-camera --target moving --video-to 127.0.0.1:5603 --mav-to 127.0.0.1:14561
 ```
 
-Wait until it says `DONE` (1–2 minutes). A window with a runway appears.
+Wait until it says `DONE` (1–2 minutes). A window with a runway appears. `--fpv-camera` gives you the FPV drone: camera fixed
+to the frame, FPV speed.
 
 **Step 2: take off.**
 
 ```bash
-cd ~/drone-gazebo/simulation && python3 takeoff.py --alt 12
+cd ~/fpv-tracking/simulation && python3 takeoff.py --alt 12
 ```
 
 The pretend drone rises to 12 metres and waits.
@@ -90,18 +94,35 @@ The pretend drone rises to 12 metres and waits.
 **Step 3 (optional): add traffic to make it harder.**
 
 ```bash
-cd ~/drone-gazebo/simulation && python3 spawn_traffic.py --cars 0 --people 0 --vehicles 14 --no-roads
+cd ~/fpv-tracking/simulation && python3 spawn_traffic.py --cars 0 --people 0 --vehicles 14 --no-roads
 ```
 
 **Step 4: start the tracker.**
 
 ```bash
-cd ~/drone-gazebo/tracker && ./build/target_tracker --profile sim-c12cam --enable-rescue --reid --video-out udp://127.0.0.1:5602 --log-dir ~/sim_run/tracker_logs
+cd ~/fpv-tracking/tracker && ./build/target_tracker --profile sim-fpv --enable-rescue --video-out udp://127.0.0.1:5602
 ```
 
-A window opens showing the drone's camera. **Run only one tracker at a time**: two would fight over the drone.
+A window opens showing the drone's camera. **Click the red box** to lock onto it, then press **G** to GO. **Run only one tracker at a time**: two would fight over the drone.
 
 **Step 5 (optional): open QGroundControl.** It connects by itself and shows the video and the action buttons.
+
+---
+
+### About the FPV drone
+
+An FPV drone has its camera **bolted to the frame**: it cannot tilt or turn on its own. So the **drone itself** turns left/right
+to keep the target in the middle, and climbs or goes down to keep it where it was in the picture when you locked. It also flies
+at **FPV speed**: up to 30 m/s (108 km/h) while following, 25 m/s for GO, leaning up to 60°.
+
+The camera looks 15° down: when the drone leans forward hard, the camera leans with it, and a steeper camera would lose a target
+ahead out of the top of the picture. To try another angle, start the simulator with `FPV_CAM_PITCH=-20 ./sim_up.sh --fpv-camera ...`
+and give the tracker the same number: `--cam-pitch-deg -20`. Do not use `--gimbal` together with `--fpv-camera`.
+Slower: add `--ceil-vx 15 --rescue-speed 12` to the tracker command. The simulator's own limits are in `simulation/fpv.parm`.
+(The older gimbal-camera drone is still available: `./sim_up.sh --gimbal --c12-camera --fast` with `--profile sim-c12cam`.)
+
+On the **real** FPV drone use `--profile real-fpv`, and always give it the camera angle you **measured** on the frame
+(`--cam-pitch-deg`, negative = looking down) and the lens's field of view (`--hfov-deg`). Wrong numbers make it steer wrongly.
 
 ---
 
@@ -115,16 +136,18 @@ A window opens showing the drone's camera. **Run only one tracker at a time**: t
 | Lock onto what is in the middle of the picture | Press **L** or the **Space bar** |
 | Lock very precisely | **Drag** a box around it, then press **S** |
 | Let go of the target | Press **U** |
-| Fly to the target | Press **G**, then **G** again within 3 seconds |
+| Fly to the target | Press **G** once |
 | Leave the target and climb to safety | Press **X** |
 | Show / hide the yellow "where it is going" box | Press **K** |
 | Quit | Press **Q** |
 
-In QGroundControl the same actions are buttons: **Track LOCK**, **Rescue GO** (press twice), **Rescue ABORT**, **Track UNLOCK**,
+In QGroundControl the same actions are buttons: **Track LOCK**, **Rescue GO** (press once), **Rescue ABORT**, **Track UNLOCK**,
 **BRAKE**.
 
 You can also type into the tracker's terminal, then Enter:
-- `go 8 3`: fly to the target at 8 m/s and stop 3 metres before it
+- `go 8 3`: fly to the target at 8 m/s and stop 3 metres **before** it
+- `go 15 -10`: fly at 15 m/s, over the target, and stop 10 metres **past** it
+- `go 0 -10`: the normal speed, stop 10 metres past it (0 = keep the normal value)
 - `unlock`, `abort`
 
 **What the colours on screen mean:**
@@ -139,7 +162,7 @@ You can also type into the tracker's terminal, then Enter:
 
 | Problem | Fix |
 |---|---|
-| The pretend drone crashed or fell over | `cd ~/drone-gazebo/simulation && python3 reset_drone.py` |
+| The pretend drone crashed or fell over | `cd ~/fpv-tracking/simulation && python3 reset_drone.py` |
 | The tracker window shows no picture | Make sure only **one** tracker is running; restart the simulator (step 7) |
 | "lock refused" | Click directly on the object, not beside it |
 | The box went onto the wrong object | Press **U**, then click your object again |
@@ -153,7 +176,7 @@ You can also type into the tracker's terminal, then Enter:
 3. Stop the simulator:
 
 ```bash
-cd ~/drone-gazebo/simulation && ./sim_down.sh
+cd ~/fpv-tracking/simulation && ./sim_down.sh
 ```
 
 ---
@@ -162,8 +185,11 @@ cd ~/drone-gazebo/simulation && ./sim_down.sh
 
 | Setting | What it changes |
 |---|---|
-| `--rescue-speed 12` | GO speed in metres per second (default 12 in the simulator) |
-| `--rescue-standoff 3` | Stop 3 metres before the target (default 0 = at the target) |
+| `--rescue-speed 15` | GO speed in metres per second (normal: 25) |
+| `--go-offset 10` | Where GO stops: `10` = 10 m **before** the target, `-10` = 10 m **past** it, `0` = at it (normal: 0) |
+
+To change the **normal** GO speed / stop point for good, edit the `GO SETTINGS -- EDIT HERE` block at the top of
+`tracker/main.cpp` (`kSpeed`, `kStopOffset`, `kAccel`), then rebuild: `cmake --build ~/fpv-tracking/tracker/build -j8`.
 | `--abort-climb 10` | How high ABORT climbs (metres) |
 | `--ceil-vx 18` | Fastest the drone may fly while following (m/s) |
 | `--reid` | Use DINOv2 so same-coloured lookalikes are not confused with your target |
@@ -185,7 +211,7 @@ cd ~/drone-gazebo/simulation && ./sim_down.sh
 ## 10. Checking that everything still works (for whoever maintains it)
 
 ```bash
-cd ~/drone-gazebo && ./run_all_tests.sh
+cd ~/fpv-tracking && ./run_all_tests.sh
 ```
 
 This builds the program, runs its 429 self-checks and the recorded-video tests. With the simulator running and **no tracker

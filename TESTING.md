@@ -43,7 +43,7 @@ Pure logic and the real CSRT on synthetic scenes, no vehicle or camera:
 - Record new footage with `python3 simulation/record_camera.py OUT.avi SECONDS`. It is safe while a tracker runs, because it
   reads Gazebo directly.
 - Experiments: environment variables reach the tracker: `CSRT_SCALE_LR`, `CSRT_PAD`, `CSRT_TF`, `CSRT_LR`, `CSRT_SCALES`,
-  `CSRT_SCALE_STEP`, `CSRT_SEG`, `KF_R`, `KF_QP`, `KF_QV`, `TRK_LEGACY`.
+  `CSRT_SCALE_STEP`, `CSRT_SEG`, `KF_R`, `KF_QP`, `KF_QV`.
 
 ## 4. Simulator scenarios (`verify_suite.py`)
 Each scenario starts a fresh tracker, drives it the way an operator or QGC would, injects faults, and grades from the tracker's
