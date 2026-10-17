@@ -3227,10 +3227,11 @@ public:
     // velocity (NED) + yaw: the GO pursuit's command. Only while it keeps coming (refreshed < 0.3 s ago); after that the resend
     // becomes a plain hold where the vehicle is
     // acc: the commanded acceleration (feed-forward, NED m/s^2): ArduPilot tilts for it at once instead of waiting for a velocity error
-    void update_goto_velocity(const fl::Ned& vel, double yaw_rad, const fl::Ned& acc = fl::Ned{}) {
+    void update_goto_velocity(const fl::Ned& vel, double yaw_rad, const fl::Ned& acc = fl::Ned{}, const fl::Ned* dest = nullptr) {
         std::lock_guard<std::mutex> lk(mtx_);
         if (!goto_active_) return;
         goto_vel_ = vel; goto_acc_ = acc; goto_has_vel_ = true; goto_yaw_ = yaw_rad; goto_vel_at_ = Clock::now();
+        if (dest) goto_dest_ = *dest;
         goto_pos_last_ = Clock::time_point();
     }
     void update_goto_point(const fl::Ned& dest, double yaw_rad) {
@@ -3751,9 +3752,11 @@ private:
                 else {
                     gd = goto_dest_; gy = goto_yaw_; gs = goto_speed_; gv = goto_vel_; ga = goto_acc_;
                     // the velocity only while the pursuit keeps refreshing it (a stale one would keep moving the setpoint): else a hold
-                    gvel = goto_has_vel_ && sec(now - goto_vel_at_) < 0.3;
-                    if (goto_has_vel_ && !gvel) {                         // the pursuit stopped commanding: hold where the vehicle is
-                        goto_has_vel_ = false; want_pos = true; goto_dest_ = stop_point_locked(); gd = goto_dest_; gy = vs_.yaw;
+                    gvel = goto_has_vel_ && sec(now - goto_vel_at_) < 1.0;
+                    if (goto_has_vel_ && !gvel) {                         // the pursuit stopped commanding: hold at target
+                        goto_has_vel_ = false; want_pos = true;
+                        if (goto_dest_.n == 0 && goto_dest_.e == 0 && goto_dest_.d == 0) goto_dest_ = stop_point_locked();
+                        gd = goto_dest_; gy = vs_.yaw;
                     }
                     if (sec(now - goto_speed_last_) >= 2.0) { want_speed = true; goto_speed_last_ = now; }
                     if (sec(now - goto_pos_last_) >= 1.0) { want_pos = true; goto_pos_last_ = now; }
@@ -4328,7 +4331,7 @@ void apply_profile(Args& a, const std::string& p) {
         if (p == "sim-gimbal") { a.follow_source = "gimbal"; a.c12_host = "127.0.0.1"; a.target_height = 0.9; }
         // sim_up.sh --c12-camera: a C12-like 1280x720 ~100 deg camera, tracked at half resolution like --profile real-c12 (so the
         // view control's digital zoom adds real detail), and the autopilot gimbal kept on the target (sim_up.sh --gimbal)
-        if (p == "sim-c12cam") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.gimbal_centre = true; a.vz_mode = "hold"; a.gimbal_settle = 0.15; a.video_latency = 0.2; a.mount_frame = "body";
+        if (p == "sim-c12cam") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.gimbal_centre = true; a.vz_mode = "hold"; a.gimbal_settle = 0.15; a.video_latency = 0.0; a.mount_frame = "body";
                                  a.yaw_ff_mode = "world"; a.kyaw = 3.0;     // centring: see "CENTRING" in the loop
                                  // digital zoom OFF by default (operator report: misses on zoom in / out -- every zoom change restarts the
                                  // tracker on a rescaled view); small targets are tracked at full resolution instead. --zoom-max 2: on
@@ -4342,7 +4345,7 @@ void apply_profile(Args& a, const std::string& p) {
         // sim_up.sh --fpv-camera: an FPV drone -- the same 1280x720 ~100 deg camera, but FIXED to the airframe, tilted --cam-pitch-deg
         // (sim_up.sh FPV_CAM_PITCH, default -15) and no gimbal: the drone itself turns to centre the target sideways and climbs /
         // descends to hold it vertically (on the depression below the horizon: fl::body_cam_vertical_error), at FPV speed
-        if (p == "sim-fpv") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.video_latency = 0.2;
+        if (p == "sim-fpv") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.video_latency = 0.0;
                               a.gimbal_centre = false; a.yaw_ff_mode = "world"; a.kyaw = 3.0; a.zoom_max = 1.0;
                               apply_fpv_flight(a); }
     } else if (p == "real-fpv") {
@@ -6468,6 +6471,13 @@ int run_tracker_mode() {
                         }
                     }
                 }
+                // Penetrate from visible front surface to the 3D centroid of the target
+                if (tgt_ok && live_target_h > 0.0) {
+                    const double half_depth = live_target_h * 0.5;
+                    const double hdg = ps.yaw + va.bearing_right;
+                    tgt.n += half_depth * std::cos(hdg);
+                    tgt.e += half_depth * std::sin(hdg);
+                }
             }
         }
         if (!tracking || lock_request) size_rng.reset();
@@ -6476,7 +6486,7 @@ int run_tracker_mode() {
         // with a latency guess, and a few degrees off moves the ground point metres (measured: +-38 deg pitch swings made a slow
         // target "move" at 26 m/s, which the speed match then chased)
         else if (tgt_ok && fsm.state() == fl::FState::LOCKED && (gimbal_mode || tracker_ok)
-                 && std::fabs(vs.pitch - ps.pitch) < fl::deg2rad(4.0) && std::fabs(vs.roll - ps.roll) < fl::deg2rad(4.0)) tgt_est.update(now - (have_ps ? args.video_latency : 0.0), tgt, tgt_sigma);   // only fresh, accepted views; stamped with the FRAME's time (the target was there ~latency ago)
+                 && (goto_path_active || (std::fabs(vs.pitch - ps.pitch) < fl::deg2rad(4.0) && std::fabs(vs.roll - ps.roll) < fl::deg2rad(4.0)))) tgt_est.update(now - (have_ps ? args.video_latency : 0.0), tgt, tgt_sigma);   // only fresh, accepted views; stamped with the FRAME's time (the target was there ~latency ago)
         const bool tgt_vel_ok = tgt_est.valid(now);
 
         // ---- view control (2 Hz): move closer or zoom so the target is big enough (fl::decide_view) ----
@@ -7172,7 +7182,7 @@ int run_tracker_mode() {
                     }
                     go_prev_v = v; go_have_prev_v = true;
                 }
-                link->update_goto_velocity(v, yaw_to, aff);
+                link->update_goto_velocity(v, yaw_to, aff, &E);
                 static const bool dbg_p = std::getenv("TRK_DEBUG") != nullptr;
                 if (dbg_p) std::printf("[PURSUIT] cmd %.1f m/s  vehicle %.1f m/s  to end %.1f m  alt %.1f\n", std::sqrt(v.n * v.n + v.e * v.e + v.d * v.d), v_now,
                     std::sqrt(std::pow(E.n - veh_now.n, 2) + std::pow(E.e - veh_now.e, 2) + std::pow(E.d - veh_now.d, 2)), -veh_now.d);
@@ -7205,20 +7215,14 @@ int run_tracker_mode() {
                     // running continuously so the drone reaches and holds directly on the object with 0 offset.
                 }
                 // nothing fresh for 3 s: stop re-aiming and hold the last point (the vehicle is not sent after a stale guess)
-                // ... unless the target was STATIC (its track < 0.5 m/s at the last fix): its last position is still where it is, so the dash
-                // carries on to it -- a slower computer (Pi 4) loses the view in a fast dash more often, and a static rescue location must
-                // still be reached
-                if (fresh) pursuit_static = tgt_est.valid(now, 1.5) && std::hypot(tgt_est.vn(), tgt_est.ve()) < 0.5;
-                // [GO-8] STOPPING (4/4) -- target not seen for 3 s: hold the last point instead of flying after a stale guess.
+                // ... unless the target was STATIC: its last position is still where it is, so the dash carries on to it
+                if (fresh) pursuit_static = !tgt_est.valid(now, 1.5) || std::hypot(tgt_est.vn(), tgt_est.ve()) < 0.5;
+                // [GO-8] STOPPING (4/4) -- target not seen for 3 s: hold the last target point instead of braking short.
                 if (goto_path_active && !(args.go_through && (go_braking || past_m >= -2.0)) && now - pursuit_seen > 3.0 && !pursuit_static) {
-                    // HOLD = a plain position target with NO velocity: ArduPilot keeps advancing a position+velocity setpoint by its
-                    // velocity on its own -- measured in SITL: holding with the last (forward, downward) velocity still attached
-                    // flew the drone into the ground 18 m past the target
-                    const fl::Ned sp = link->stop_point();                 // brake to a stop, no fly-back to where the hold was decided
-                    goto_hold = fl::Ned{sp.n, sp.e, std::min(sp.d, pursuit_floor_d)};
+                    goto_hold = fl::Ned{pursuit_last.n, pursuit_last.e, std::min(pursuit_last.d, pursuit_floor_d)};
                     link->update_goto_point(goto_hold, vs.yaw);
                     goto_path_active = false;
-                    say("GO-TO: target not seen for 3 s -- holding the last point", SEV_WARN, "GO-TO: target lost, holding");
+                    say("GO-TO: target not seen for 3 s -- holding target point", SEV_WARN, "GO-TO: target lost, holding target");
                 }
             } else if (goto_path_active) {
                 // Closed-loop homing: as long as the lock holds, keep refining the endpoint from the LIVE tracked box -- a single
