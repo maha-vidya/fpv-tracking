@@ -1,0 +1,60 @@
+{
+    "version": 1,
+    "fileType": "MavlinkActions",
+    "actions": [
+        {
+            "label": "Track LOCK",
+            "description": "Lock the target: the detector's relock candidate if one is shown, otherwise the centre of the image (point the camera at it first)",
+            "mavCmd": 31014,
+            "compId": 191
+        },
+        {
+            "label": "GO (default)",
+            "description": "ONE press: GO now (with --go-confirm: 1st press arms and shows distance/ETA, 2nd within 3 s confirms). Uses the tracker's configured speed (30 m/s) directly on the target (offset = 0)",
+            "mavCmd": 31010,
+            "compId": 191
+        },
+        {
+            "label": "GO 15 m/s, stop 3 m short",
+            "description": "GO at 15 m/s, stopping 3 m before the target. One press.",
+            "mavCmd": 31010,
+            "compId": 191,
+            "param1": 15,
+            "param2": 3
+        },
+        {
+            "label": "GO, stop 10 m past",
+            "description": "GO at configured speed (30 m/s), passing directly over the target, stopping 10 m PAST it (param2 = -10). One press.",
+            "mavCmd": 31010,
+            "compId": 191,
+            "param1": 0,
+            "param2": -10
+        },
+        {
+            "label": "GO high-speed 30 m/s, on target",
+            "description": "High-speed FPV Dash at 30 m/s directly on the target (param1 = 30 m/s, param2 = 0 m). One press.",
+            "mavCmd": 31010,
+            "compId": 191,
+            "param1": 30,
+            "param2": 0
+        },
+        {
+            "label": "ABORT (climb away)",
+            "description": "Leave the target and climb (--abort-climb, default 10 m), then hold in GUIDED",
+            "mavCmd": 31011,
+            "compId": 191
+        },
+        {
+            "label": "Track UNLOCK",
+            "description": "Drop the target lock and stop following",
+            "mavCmd": 31012,
+            "compId": 191
+        },
+        {
+            "label": "BRAKE",
+            "description": "Panic button: stop the companion's go-to and switch the vehicle to BRAKE",
+            "mavCmd": 31013,
+            "compId": 191
+        }
+    ]
+}

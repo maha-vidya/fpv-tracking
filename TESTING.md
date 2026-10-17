@@ -5,7 +5,7 @@ Four levels, from fast and offline to the full simulator. `./run_all_tests.sh` r
 | Level | What | Needs | Time |
 |---|---|---|---|
 | 1. Build | `-Werror` build, exactly as CI | compiler, OpenCV | ~1 min |
-| 2. Unit tests | `target_tracker --selftest` (429 checks) + all Python scripts compile | nothing | ~20 s |
+| 2. Unit tests | `target_tracker --selftest` (466 checks) + all Python scripts compile | nothing | ~20 s |
 | 3. Offline benchmarks | `tracker/tests/lock_bench.py` (click-to-lock) and `tracker/tests/track_bench.py` (tracking) on saved data | saved clicks / recordings | 1–5 min |
 | 4. Simulator scenarios | `simulation/verify_suite.py` (16 scenarios + endurance) | `sim_up.sh` running, drone airborne, **no other tracker** | ~15 min (+10 endurance) |
 
@@ -26,7 +26,7 @@ Pure logic and the real CSRT on synthetic scenes, no vehicle or camera:
   (stand-in) fingerprints the lock comes back on the target.
 - Camera-motion estimation, including a large object filling 40% of the view.
 - The Kalman filter, geometry and height references.
-- GO: the end point (stop distance, height floor), the speed / braking law, the arrival rule.
+- GO (FPV Dash): direct 3D target coordinates (no safety floor), speed / braking law, moving target PN guidance, arrival rule.
 - QGC STATUSTEXT, lat/lon.
 
 ## 3. Offline benchmarks
@@ -45,7 +45,21 @@ Pure logic and the real CSRT on synthetic scenes, no vehicle or camera:
 - Experiments: environment variables reach the tracker: `CSRT_SCALE_LR`, `CSRT_PAD`, `CSRT_TF`, `CSRT_LR`, `CSRT_SCALES`,
   `CSRT_SCALE_STEP`, `CSRT_SEG`, `KF_R`, `KF_QP`, `KF_QV`.
 
-## 4. Simulator scenarios (`verify_suite.py`)
+## 4. FPV Flight Stability Test (`simulation/stability_test.py`)
+Direct end-to-end telemetry and computer vision stability verification across all flight phases:
+```bash
+cd simulation && python3 stability_test.py
+```
+Measures:
+- Airframe vibration / shake (deg/s rate jitter)
+- Pitch and roll extremes (deg)
+- Pitch reversals ("nods/min")
+- Whole-picture frame-to-frame pixel jitter (px)
+- Direct 3D target intercept with no artificial floor hold
+
+Pass criteria: PASS on all four phases (`takeoff`, `hover`, `follow`, `go`).
+
+## 5. Simulator scenarios (`verify_suite.py`)
 Each scenario starts a fresh tracker, drives it the way an operator or QGC would, injects faults, and grades from the tracker's
 own log and Gazebo's truth. The suite **refuses to start if another tracker is connected**, and marks any result **VOID** if one
 joins during it: two trackers take the vehicle link and the video from each other.
@@ -58,12 +72,12 @@ joins during it: two trackers take the vehicle link and the video from each othe
 | `mode` | pilot mode change drops the lock; no relock on return to GUIDED |
 | `linkloss` | 7 s MAVLink freeze → LINK_LOST |
 | `vfreeze` | 5 s video freeze → no command from stale data |
-| `rescue` | GO confirmation, GO sent, ABORT during GO climbs away |
+| `dash` | FPV Dash: GO sent, direct 3D target intercept, ABORT during GO climbs away |
 | `abortfollow` | ABORT while following climbs away, no relock |
 | `losthover` | target lost → hovers in place (< 0.5 m) |
 | `qgc` | QGC video tap, LOCK, UNLOCK, GO, ABORT, BRAKE (as QGC sends them, acknowledged) |
 | `goto` | GO pursuit vs truth: closest distance, top speed, arrival |
-| `gostop` | `go 5 3`: stops ~3 m from the target |
+| `gostop` | `go 5 0`: direct arrival on target without safety floor |
 | `large` | a 4 m magenta truck: lock box and 30 s tracking vs its pixels |
 | `occlusion` | the red box with the car driving over it: never on the car, re-acquired |
 | `people` | how long a small walker stays locked |

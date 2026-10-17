@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
     --fast)     FAST_PARAMS="--add-param-file $HERE/fast.parm"; shift;;   # fast GO dashes: higher speed / descent / acceleration limits (simulation/fast.parm)
     --gimbal)   GIMBAL_PARAMS="--add-param-file $ARDUPILOT_GAZEBO_DIR/config/gazebo-iris-gimbal.parm"; shift;;   # ArduPilot drives the camera gimbal (target_tracker --gimbal-centre)
     --c12-camera) C12_CAMERA=1; shift;;     # a C12-like camera: 1280x720, ~100 deg (target_tracker --profile sim-c12cam)
-    --fpv-camera) FPV_CAMERA=1; C12_CAMERA=1; FPV_PARAMS="--add-param-file $HERE/fpv.parm"; shift;;   # no gimbal, FPV speed (target_tracker --profile sim-fpv)
+    --fpv-camera) FPV_CAMERA=1; C12_CAMERA=1; FPV_PARAMS="--add-param-file ${FPV_PARM:-$HERE/fpv.parm}"; shift;;   # FPV_PARM=<file>: another ArduPilot parameter file (tests)   # no gimbal, FPV speed (target_tracker --profile sim-fpv)
     --no-gui)   GUI=0; shift;;                # physics + camera only: saves about two CPU cores (open the GUI later with: gz sim -g)
     *) echo "unknown option $1"; exit 2;;
   esac
@@ -121,6 +121,12 @@ g = d + "/gimbal_small_3d/model.sdf"; s = open(g).read()
 s, n = re.subn(r'<joint name="(yaw|roll|pitch)_joint" type="revolute">', r'<joint name="\1_joint" type="fixed">', s); assert n == 3, n
 s = re.sub(r'(<joint name="(?:yaw|roll|pitch)_joint" type="fixed">.*?)<axis>.*?</axis>', r'\1', s, flags=re.S)
 s, n = re.subn(r'(<sensor name="camera" type="camera">\s*(?:<[^>]+>[^<]*</[^>]+>\s*)*?)<pose>[^<]*</pose>', r'\g<1><pose>0 0 0 %.6f %.6f %.6f</pose>' % (r, p, y), s, count=1); assert n == 1
+# STABILITY (the drone shook ~13-17 Hz in roll, even on take-off, measured in SITL): welded, the gimbal's 10 g links can no
+# longer move out of any contact with the airframe, and their collision shapes made the physics push against it every step.
+# A camera needs no collision: drop them all. And 10 g links with 1e-5 kg m^2 rigidly chained are numerically stiff: give them
+# 1e-4 (still negligible next to the 1.5 kg airframe).
+s, n = re.subn(r'\s*<collision name="[^"]*">.*?</collision>', '', s, flags=re.S); assert n >= 4, n
+s = re.sub(r'<(ixx|iyy|izz)>0\.00001</\1>', r'<\1>0.0001</\1>', s)
 open(g, "w").write(s)
 m = d + "/iris_with_gimbal/model.sdf"; s = open(m).read()
 s = s.replace('<joint name="gimbal_joint" type="revolute">', '<joint name="gimbal_joint" type="fixed">')
@@ -180,7 +186,7 @@ gz topic -t "${CAM_TOPIC}/enable_streaming" -m gz.msgs.Boolean -p 'data: 1' >/de
 
 # 6. target boxes
 case "$TARGET" in
-  moving) start target python3 "$HERE/move_target.py";;
+  moving) start target python3 -u "$HERE/move_target.py";;
   static) python3 "$HERE/move_target.py" --once 0 15 > "$RUN_DIR/target.log" 2>&1; echo "[sim_up] target placed (static)";;
   none)   ;;
 esac

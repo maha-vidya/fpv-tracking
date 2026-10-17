@@ -102,8 +102,13 @@ def main():
     want = [RED] + ([] if a.no_lookalike or a.once else [ORANGE])
     for name, rgba in want:
         if name not in have:
-            ok = gz.spawn(name, rgba, a.cx, a.cy)
-            print("[spawn] %s: %s" % (name, "ok" if ok else "FAILED"))
+            ok = False
+            for _ in range(30):
+                ok = gz.spawn(name, rgba, a.cx, a.cy)
+                if ok:
+                    break
+                time.sleep(1.0)
+            print("[spawn] %s: %s" % (name, "ok" if ok else "FAILED"), flush=True)
             if not ok:
                 sys.exit("could not spawn %s: is Gazebo running with world %s?" % (name, WORLD))
     if a.once:

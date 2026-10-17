@@ -1,4 +1,7 @@
-# Running the rescue drone in simulation
+# Running the FPV tracking & dash drone in simulation
+
+> [!NOTE]
+> This project has transitioned to high-speed FPV tracking and dash. Please refer to [FPV_DASH.md](FPV_DASH.md) for the active documentation and runbook.
 
 This is the step-by-step runbook for the `tracker/` companion program: bring up Gazebo + ArduPilot SITL,
 run the companion program, lock/follow/go-to-target from the keyboard, stdin, RC, or QGC, and what to

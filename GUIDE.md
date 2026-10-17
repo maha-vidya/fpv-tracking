@@ -100,7 +100,7 @@ cd ~/fpv-tracking/simulation && python3 spawn_traffic.py --cars 0 --people 0 --v
 **Step 4: start the tracker.**
 
 ```bash
-cd ~/fpv-tracking/tracker && ./build/target_tracker --profile sim-fpv --enable-rescue --video-out udp://127.0.0.1:5602
+cd ~/fpv-tracking/tracker && ./build/target_tracker --profile sim-fpv --enable-dash --video-out udp://127.0.0.1:5602
 ```
 
 A window opens showing the drone's camera. **Click the red box** to lock onto it, then press **G** to GO. **Run only one tracker at a time**: two would fight over the drone.
@@ -112,13 +112,15 @@ A window opens showing the drone's camera. **Click the red box** to lock onto it
 ### About the FPV drone
 
 An FPV drone has its camera **bolted to the frame**: it cannot tilt or turn on its own. So the **drone itself** turns left/right
-to keep the target in the middle, and climbs or goes down to keep it where it was in the picture when you locked. It also flies
+and climbs or dives to keep the target **on the + in the middle of the picture**. There is no artificial safety floor:
+the drone flies directly down onto the target's exact 3D coordinates. (`--no-centre-target`: keep the target
+where it was in the picture when you locked, without moving up/down to centre it.) It also flies
 at **FPV speed**: up to 30 m/s (108 km/h) while following, 25 m/s for GO, leaning up to 60°.
 
 The camera looks 15° down: when the drone leans forward hard, the camera leans with it, and a steeper camera would lose a target
 ahead out of the top of the picture. To try another angle, start the simulator with `FPV_CAM_PITCH=-20 ./sim_up.sh --fpv-camera ...`
 and give the tracker the same number: `--cam-pitch-deg -20`. Do not use `--gimbal` together with `--fpv-camera`.
-Slower: add `--ceil-vx 15 --rescue-speed 12` to the tracker command. The simulator's own limits are in `simulation/fpv.parm`.
+Slower: add `--ceil-vx 15 --dash-speed 12` to the tracker command. The simulator's own limits are in `simulation/fpv.parm`.
 (The older gimbal-camera drone is still available: `./sim_up.sh --gimbal --c12-camera --fast` with `--profile sim-c12cam`.)
 
 On the **real** FPV drone use `--profile real-fpv`, and always give it the camera angle you **measured** on the frame
@@ -132,16 +134,15 @@ On the **real** FPV drone use `--profile real-fpv`, and always give it the camer
 
 | To do this | Do this |
 |---|---|
-| Lock onto something | **Click it** once |
-| Lock onto what is in the middle of the picture | Press **L** or the **Space bar** |
-| Lock very precisely | **Drag** a box around it, then press **S** |
+| Lock onto something | **Click it** once (no dragging required; auto-segments target) |
+| Lock onto what is in the middle of the picture | Press **L**, **S**, or the **Space bar** |
 | Let go of the target | Press **U** |
-| Fly to the target | Press **G** once |
+| Fly to the target (FPV Dash) | Press **G** once |
 | Leave the target and climb to safety | Press **X** |
 | Show / hide the yellow "where it is going" box | Press **K** |
 | Quit | Press **Q** |
 
-In QGroundControl the same actions are buttons: **Track LOCK**, **Rescue GO** (press once), **Rescue ABORT**, **Track UNLOCK**,
+In QGroundControl the same actions are buttons: **Track LOCK**, **FPV Dash GO** (press once), **ABORT**, **Track UNLOCK**,
 **BRAKE**.
 
 You can also type into the tracker's terminal, then Enter:
@@ -152,6 +153,8 @@ You can also type into the tracker's terminal, then Enter:
 
 **What the colours on screen mean:**
 - **Green box:** locked and following.
+- **`GO READY - PRESS G`** (green writing at the top): GO will go when you press it. **`GO NOT READY: ...`** (yellow) says what
+  is still missing, for example "lock held 1.2s, need 2s".
 - **Orange / red box with a word:** the target is briefly hidden (`COASTING`) or lost (`LOST`).
 - **Yellow box with an arrow:** where the target is expected to be in half a second.
 - **Crosshair and "CENTRE off x,y":** how far the target is from the middle of the picture (green = good).
@@ -185,15 +188,15 @@ cd ~/fpv-tracking/simulation && ./sim_down.sh
 
 | Setting | What it changes |
 |---|---|
-| `--rescue-speed 15` | GO speed in metres per second (normal: 25) |
-| `--go-offset 10` | Where GO stops: `10` = 10 m **before** the target, `-10` = 10 m **past** it, `0` = at it (normal: 0) |
+| `--dash-speed 15` | GO speed in metres per second (normal: 30) |
+| `--go-offset 10` | Where GO stops: `10` = 10 m **before** the target, `-10` = 10 m **past** it, `0` = directly on it (normal: 0) |
 
 To change the **normal** GO speed / stop point for good, edit the `GO SETTINGS -- EDIT HERE` block at the top of
-`tracker/main.cpp` (`kSpeed`, `kStopOffset`, `kAccel`), then rebuild: `cmake --build ~/fpv-tracking/tracker/build -j8`.
+`tracker/main.cpp` (`kSpeed = 30.0`, `kStopOffset = 0.0`, `kAccel = 10.0`), then rebuild: `cmake --build ~/fpv-tracking/tracker/build -j8`.
 | `--abort-climb 10` | How high ABORT climbs (metres) |
 | `--ceil-vx 18` | Fastest the drone may fly while following (m/s) |
 | `--reid` | Use DINOv2 so same-coloured lookalikes are not confused with your target |
-| `--go-guidance pn` | How GO flies: `pn` (default, best for moving targets), `pursuit`, `lead`, `intercept` |
+| `--go-guidance pn` | How GO flies: `pn` (default, True 3D Proportional Navigation for moving and stationary targets), `pursuit`, `lead`, `intercept` |
 | `--no-speed-match` | Do not match the target's speed while following |
 | `--zoom-max 2` | Allow digital zoom (off by default) |
 
@@ -214,7 +217,7 @@ To change the **normal** GO speed / stop point for good, edit the `GO SETTINGS -
 cd ~/fpv-tracking && ./run_all_tests.sh
 ```
 
-This builds the program, runs its 429 self-checks and the recorded-video tests. With the simulator running and **no tracker
+This builds the program, runs its 466 self-checks and the recorded-video tests. With the simulator running and **no tracker
 open**, `./run_all_tests.sh --sim` also flies the 16 simulator tests.
 
 Logs of every flight are kept in `~/sim_run/tracker_logs/`: one line per video frame, plus a picture of every click.
