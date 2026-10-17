@@ -1975,10 +1975,13 @@ inline double past_target_m(const Ned& veh, const Ned& tgt, const Ned& from, dou
 }
 inline Ned pursuit_point(const Ned& veh, const Ned& tgt, double standoff, double floor_d, const Ned* from = nullptr) {
     const double dn = tgt.n - veh.n, de = tgt.e - veh.e, dh = std::hypot(dn, de);
-    Ned e{veh.n, veh.e, tgt.d}; // Sets destination altitude directly to the target's depth (tgt.d)
+    Ned e{tgt.n, tgt.e, tgt.d}; // Sets destination altitude directly to the target's depth (tgt.d)
     
-    if (standoff >= 0) {
+    if (std::abs(standoff) < 1e-4) {
+        e.n = tgt.n; e.e = tgt.e;
+    } else if (standoff > 0) {
         if (dh > standoff) { const double k = (dh - standoff) / dh; e.n = veh.n + k * dn; e.e = veh.e + k * de; }
+        else { e.n = veh.n; e.e = veh.e; }
     } else {
         const Ned& o = from ? *from : veh;
         const double an = tgt.n - o.n, ae = tgt.e - o.e, ah = std::hypot(an, ae);
@@ -1991,13 +1994,16 @@ inline Ned pursuit_point(const Ned& veh, const Ned& tgt, double standoff, double
 }
 
 // GO pursuit velocity: straight at the end point at the GO speed, braking from the vehicle's ACTUAL distance so that it stops
-// there: v <= sqrt(2 a (d - v_now * lag)) -- the autopilot needs ~`lag` s to respond. Measured before, with a moving position
-// setpoint instead: ArduPilot trailed it by ~1.5 s, so the drone surged and stalled (~2 m/s average on an "8 m/s" GO) and
-// overshot the end into the ground. Velocity commands also stop on their own: ArduPilot zeroes them after GUID_TIMEOUT.
+// there: v <= sqrt(2 a (d - v_now * lag)) -- the autopilot needs ~`lag` s to respond. When lag == 0 (direct contact/zero standoff),
+// maintains positive closing velocity all the way down to d < 0.05m to prevent premature stopping short of the target.
 inline Ned pursuit_velocity(const Ned& veh, const Ned& end, double v_now, double speed, double acc, double lag) {
     const double dn = end.n - veh.n, de = end.e - veh.e, dd = end.d - veh.d, d = std::sqrt(dn * dn + de * de + dd * dd);
     if (d < 0.05) return Ned{0, 0, 0};
-    const double s = std::min(speed, std::sqrt(2.0 * acc * std::max(0.0, d - v_now * lag)));
+    const double d_eff = lag > 0.0 ? std::max(0.0, d - v_now * lag) : d;
+    double s = std::min(speed, std::sqrt(2.0 * acc * d_eff));
+    if (lag <= 0.0 && d > 0.05) {
+        s = std::min(speed, s + 0.3); // positive closing velocity all the way down to target
+    }
     return Ned{dn / d * s, de / d * s, dd / d * s};
 }
 
@@ -2031,12 +2037,13 @@ inline Ned go_velocity(int mode, const Ned& veh, const Ned& v_veh, const Ned& tg
                        double standoff, double floor_d, double speed, double acc, double lag, double N, const Ned* from = nullptr) {
     // standoff: the signed stop offset (+ before / - past the target), `from`: where GO started -- see pursuit_point
     const double vnow = std::sqrt(v_veh.n * v_veh.n + v_veh.e * v_veh.e + v_veh.d * v_veh.d);
-    if (mode == 0) return pursuit_velocity(veh, pursuit_point(veh, tgt, standoff, floor_d, from), vnow, speed, acc, lag);
+    const double eff_lag = (standoff <= 0.0) ? 0.0 : lag;
+    if (mode == 0) return pursuit_velocity(veh, pursuit_point(veh, tgt, standoff, floor_d, from), vnow, speed, acc, eff_lag);
     const Ned aim = mode == 2 ? intercept_point(veh, speed, predict) : tgt;
     const Ned end = pursuit_point(veh, aim, standoff, floor_d, from);
     const Ned vrel{v_veh.n - v_tgt.n, v_veh.e - v_tgt.e, v_veh.d - v_tgt.d};
     const double vrel_m = std::sqrt(vrel.n * vrel.n + vrel.e * vrel.e + vrel.d * vrel.d);
-    Ned v = pursuit_velocity(veh, end, vrel_m, speed, acc, lag);                 // closing velocity, braked on the relative motion
+    Ned v = pursuit_velocity(veh, end, vrel_m, speed, acc, eff_lag);                 // closing velocity, braked on the relative motion
     // near the aim point the target's motion takes over; far away (intercept) the aim already leads it
     const double dn = end.n - veh.n, de = end.e - veh.e, dd = end.d - veh.d, d = std::sqrt(dn * dn + de * de + dd * dd);
     const double ff = mode == 2 ? std::clamp(1.0 - d / std::max(1.0, 1.5 * speed), 0.0, 1.0) : 1.0;
@@ -7054,7 +7061,7 @@ int run_tracker_mode() {
                     say(bm, SEV_INFO, "GO: through, braking");
                 }
                 const double yaw_to = (args.go_through && (go_braking || past_m >= -3.0)) ? (go_braking ? go_brake_yaw : pass_yaw)
-                    : std::hypot(look.n - veh_now.n, look.e - veh_now.e) > 1.0 ? fl::bearing_to(veh_now, look) : vs.yaw;
+                    : std::hypot(look.n - veh_now.n, look.e - veh_now.e) > 0.05 ? fl::bearing_to(veh_now, look) : vs.yaw;
                 const double v_now = std::sqrt(vs.vel[0] * vs.vel[0] + vs.vel[1] * vs.vel[1] + vs.vel[2] * vs.vel[2]);
                 // guidance (--go-guidance): against a MOVING target the approach is relative to it -- see fl::go_velocity. The target's
                 // velocity and its turn-aware future come from the IMM-UKF track; without a valid track: the previous pursuit law.
@@ -7065,7 +7072,8 @@ int run_tracker_mode() {
                 fl::Ned v;
                 const double pass_d = (args.fixed_horizontal || !args.rescue_descend) ? veh_now.d : pursuit_floor_d;
                 if (!args.go_through) {
-                    v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, go_standoff, pursuit_floor_d, go_speed, args.goto_accel, 0.5, args.pn_gain, &goto_start);
+                    const double eff_lag = (go_standoff <= 0.0) ? 0.0 : 0.5;
+                    v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, go_standoff, pursuit_floor_d, go_speed, args.goto_accel, eff_lag, args.pn_gain, &goto_start);
                     // Proportional vertical glide slope: locks vertical closure rate to horizontal closure rate
                     // so target altitude is reached exactly at the target, preventing premature ground contact or diving
                     if (args.fixed_horizontal) {
@@ -7074,7 +7082,7 @@ int run_tracker_mode() {
                         const double dh = std::hypot(T.n - veh_now.n, T.e - veh_now.e);
                         double vh = std::hypot(v.n, v.e);
                         const double dz = pass_d - veh_now.d;
-                        if (dh > 0.5) {
+                        if (dh > 0.05) {
                             const double slope = dz / dh;
                             double vd_cmd = vh * slope;
                             if (std::abs(vd_cmd) > args.ceil_vz && std::abs(slope) > 1e-4) {
@@ -7090,7 +7098,7 @@ int run_tracker_mode() {
                 } else if (!go_braking) {
                     if (past_m < 0) {
                         // Approach: proportional navigation straight onto collision course with the target aperture
-                        v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, -1000.0, pass_d, go_speed, args.goto_accel, 0.5, args.pn_gain, &goto_start);
+                        v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, -1000.0, pass_d, go_speed, args.goto_accel, 0.0, args.pn_gain, &goto_start);
                         // Vertical glide: align smoothly to target altitude pass_d so it is reached AT the opening (or level flight on fixed horizontal)
                         if (args.fixed_horizontal) {
                             v.d = 0.0;
@@ -7180,20 +7188,21 @@ int run_tracker_mode() {
                     on_go_arrived(*link, veh_now, T, -past_m);
                 }
                 if (!args.go_through) {                                       // arrival at the stop point (fly-through: above, when stopped)
-                    // arrived: within 0.5 m of the end point -- plus half a second of the target's own motion for a MOVING target, whose end
-                    // point moves on (the relative approach trails it by about that; suite: arrival not reported on the moving box)
                     const double vt_go = tgt_est.valid(now, 1.0) ? std::hypot(tgt_est.vn(), tgt_est.ve()) : 0.0;
-                    if (!pursuit_arrived && togo < 1.0 + 0.5 * vt_go) {   // 1 m: the ground estimate's own accuracy up close (0.5 was never met live)
+                    const double arrival_dist = (go_standoff <= 0.0) ? 0.2 : (std::max(0.2, go_standoff * 0.5) + 0.5 * vt_go);
+                    if (!pursuit_arrived && togo < arrival_dist) {
                         pursuit_arrived = true;
-                        char am[96]; std::snprintf(am, sizeof am, "GO-TO arrived: %.1f m %s the target", std::fabs(go_standoff), go_standoff >= 0 ? "before" : "past");
+                        char am[96];
+                        if (std::abs(go_standoff) < 0.05) {
+                            std::snprintf(am, sizeof am, "GO-TO arrived: ON TARGET (0.0 m) - actively tracking");
+                        } else {
+                            std::snprintf(am, sizeof am, "GO-TO arrived: %.1f m %s the target", std::fabs(go_standoff), go_standoff >= 0 ? "before" : "past");
+                        }
                         say(am, SEV_INFO, "GO-TO arrived");
                         on_go_arrived(*link, veh_now, T, go_standoff);        // the operator's own landing / next step (empty here)
-                    } else if (pursuit_arrived && togo > 2.0) pursuit_arrived = false;   // it moved off: chasing again
-                    if (pursuit_arrived && v_now < 1.2 && togo < 1.0) {
-                        goto_hold = E;
-                        link->update_goto_point(goto_hold, yaw_to);
-                        goto_path_active = false;
-                    }
+                    } else if (pursuit_arrived && togo > 1.5) pursuit_arrived = false;   // it moved off: chasing again
+                    // Never cancel goto_path_active on arrival: keep the active 3D PN velocity loop
+                    // running continuously so the drone reaches and holds directly on the object with 0 offset.
                 }
                 // nothing fresh for 3 s: stop re-aiming and hold the last point (the vehicle is not sent after a stale guess)
                 // ... unless the target was STATIC (its track < 0.5 m/s at the last fix): its last position is still where it is, so the dash
