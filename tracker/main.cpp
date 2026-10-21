@@ -62,12 +62,12 @@ constexpr double kSpeed = 30.0;
 //   +10  stop 10 m BEFORE the target (short of it)
 //     0  stop AT the target
 //   -10  fly over the target and stop 10 m PAST it (in the direction GO was flying when it started)
-// The stop point is never lower than --alt-floor above the target's ground, whatever the offset. A moving target is followed:
-// the stop point moves with it. What happens there (landing, a release) is your code in on_go_arrived() [GO-7].
-constexpr double kStopOffset = 0.0;
+// Negative offset (-0.55 m): compensates for the drone center of mass being 0.55 m behind the nose,
+// driving positive penetration through the target center.
+constexpr double kStopOffset = -0.55;
 // Braking (and speed-up) rate, m/s^2: the dash accelerates and decelerates at this rate so it stops ON the stop point.
-// High speed FPV dash acceleration: 10.0 m/s^2.
-constexpr double kAccel = 10.0;
+// Cap dash acceleration tilt to <= 30 deg (a <= g * tan(30 deg) = 5.66 m/s^2) so target stays firmly inside camera FOV.
+constexpr double kAccel = 5.5;
 // FLY THROUGH the target, true / false:
 //   true   accelerates all the way to the target and passes over it without braking, then brakes smoothly only after it is past.
 constexpr bool kFlyThrough = false;
@@ -3498,6 +3498,14 @@ private:
         uint8_t ts, tc; { std::lock_guard<std::mutex> lk(mtx_); ts = vs_.sysid; tc = vs_.compid; }
         send_command_long(ts, tc, MAV_CMD_DO_CHANGE_SPEED, 0, 1.0f /*SPEED_TYPE_GROUNDSPEED*/, (float)speed_ms, -1.0f);
     }
+    void send_param_set(const char* param_id, float value) {
+        uint8_t ts, tc; { std::lock_guard<std::mutex> lk(mtx_); ts = vs_.sysid ? vs_.sysid : cfg_.sysid; tc = vs_.compid ? vs_.compid : 1; }
+        char id_buf[17] = {0};
+        std::strncpy(id_buf, param_id, 16);
+        mavlink_message_t m;
+        mavlink_msg_param_set_pack(cfg_.sysid, cfg_.compid, &m, ts, tc, id_buf, value, MAV_PARAM_TYPE_REAL32);
+        send_msg(m);
+    }
     void request_streams() {                               // MAV_CMD_SET_MESSAGE_INTERVAL: id, interval us, ..., param7 = 0
         struct S { int id; int us; };
         const S want[] = {{MAVLINK_MSG_ID_RC_CHANNELS, 100000}, {MAVLINK_MSG_ID_ATTITUDE, 20000}, {MAVLINK_MSG_ID_LOCAL_POSITION_NED, 50000},   // 50 / 20 Hz: the centring uses the yaw at each frame's time (10 Hz left it up to 100 ms stale)
@@ -3531,7 +3539,12 @@ private:
                 vs_.custom_mode = h.custom_mode; vs_.guided = (h.custom_mode == 4); vs_.armed = (h.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
                 if (vs_.guided && pend_mode_) { pend_mode_ = false; log("mode GUIDED confirmed"); }
             }
-            if (regained) { log("vehicle heartbeat " + std::to_string(m.sysid) + ":" + std::to_string(m.compid) + " (link up)"); request_streams(); }
+            if (regained) {
+                log("vehicle heartbeat " + std::to_string(m.sysid) + ":" + std::to_string(m.compid) + " (link up)");
+                request_streams();
+                send_param_set("FS_CRASH_CHECK", 0.0f);
+                send_param_set("ATC_ANGLE_MAX", 30.0f);
+            }
             return;
         }
         std::lock_guard<std::mutex> lk(mtx_);
@@ -4300,8 +4313,9 @@ std::string arg_value(int argc, char** argv, int& i) {
 // Matched to simulation/fpv.parm (ArduPilot: 30 m/s, 15 m/s^2, 60 deg lean).
 inline void apply_fpv_flight(Args& a) {
     a.camera_mount = "body"; a.cam_pitch_deg = -15.0; a.vz_mode = "center";
-    a.centre_target = true; a.kz = 4.0; a.centre_kx = 3.0; a.view_climb = false;
+    a.centre_target = true; a.kz = 2.0; a.centre_kx = 0.0; a.view_climb = false;
     a.ceil_vx = 30.0; a.ceil_vy = 20.0; a.ceil_vz = 10.0; a.ceil_yaw = 4.0;      // high-speed FPV agility
+    a.kyaw = 2.0;
     // GO speed / braking / stop offset: from go_settings block at the top of the file
     a.speed_match_accel = 12.0; a.view_approach_speed = 10.0;                  // fast follow and closure
     a.fpv_speed = 30.0; a.fpv_accel = 10.0; a.fpv_approach = 15.0;             // high-speed chase
@@ -4362,7 +4376,7 @@ void apply_profile(Args& a, const std::string& p) {
         // (sim_up.sh FPV_CAM_PITCH, default -15) and no gimbal: the drone itself turns to centre the target sideways and climbs /
         // descends to hold it vertically (on the depression below the horizon: fl::body_cam_vertical_error), at FPV speed
         if (p == "sim-fpv") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.video_latency = 0.2;
-                              a.gimbal_centre = false; a.yaw_ff_mode = "world"; a.kyaw = 3.0; a.zoom_max = 1.0;
+                              a.gimbal_centre = false; a.yaw_ff_mode = "world"; a.kyaw = 2.0; a.zoom_max = 1.0;
                               apply_fpv_flight(a); }
     } else if (p == "real-fpv") {
         // the real FPV drone: camera fixed to the airframe (no gimbal, no C12). MEASURE the mount's tilt on the airframe and pass it
@@ -6498,19 +6512,32 @@ int run_tracker_mode() {
             if (have_va && !gimbal_mode) los_dep = va_cen.depression;
             if (args.gimbal_centre && now - gimbal_jump_at < args.gimbal_settle) have_va = false;
             if (have_va) {
-                // Ground-referenced fix: project bottom of bounding box to ground, then offset to true target centroid
-                if (!gimbal_mode && va_bot.depression > fl::deg2rad(4.0) && h_ground > 0.05) {
-                    const double base_dist = h_ground / std::tan(va_bot.depression);
-                    const double hdg = ps.yaw + va_bot.bearing_right;
-                    const double half_depth = std::max(0.05, live_target_h * 0.5);
-                    tgt.n = veh_then.n + (base_dist + half_depth) * std::cos(hdg);
-                    tgt.e = veh_then.e + (base_dist + half_depth) * std::sin(hdg);
-                    tgt.d = (veh_then.d + h_ground) - half_depth;
+                const double tgt_h = (live_target_h > 0.05) ? live_target_h : 1.0;
+                const double contact_h = std::clamp(tgt_h * 0.85, 0.85, tgt_h);
+                const double ground_d = veh_then.d + h_ground;
+                tgt.d = ground_d - contact_h; // z = 0.85-1.0m, landing gear clears asphalt completely
+
+                double dist_h = 0.0;
+                double hdg = ps.yaw + va_cen.bearing_right;
+                const double h_to_centroid = h_ground - 0.5 * tgt_h;
+
+                if (!gimbal_mode && va_cen.depression > fl::deg2rad(4.0) && h_to_centroid > 0.1) {
+                    dist_h = h_to_centroid / std::tan(va_cen.depression); // True 3D centroid ray intersection
+                    tgt.n = veh_then.n + dist_h * std::cos(hdg);
+                    tgt.e = veh_then.e + dist_h * std::sin(hdg);
+                    tgt_ok = true;
+                    tgt_sigma = fl::geometry_sigma(h_ground, va_cen.depression);
+                } else if (!gimbal_mode && va_bot.depression > fl::deg2rad(4.0) && h_ground > 0.1) {
+                    dist_h = (h_ground / std::tan(va_bot.depression)) + 0.5 * tgt_h;
+                    hdg = ps.yaw + va_bot.bearing_right;
+                    tgt.n = veh_then.n + dist_h * std::cos(hdg);
+                    tgt.e = veh_then.e + dist_h * std::sin(hdg);
                     tgt_ok = true;
                     tgt_sigma = fl::geometry_sigma(h_ground, va_bot.depression);
                 } else {
                     const double height = std::max(0.05, h_ground - std::max(0.0, live_target_h) * 0.5);
                     tgt_ok = fl::target_ned_from_view(veh_then, ps.yaw, height, va_cen.bearing_right, va_cen.depression, fl::deg2rad(args.min_depression_deg), tgt, 0.05);
+                    tgt.d = ground_d - contact_h;
                     tgt_sigma = fl::geometry_sigma(height, va_cen.depression);
                 }
                 // 3D positioning from optical extent and line-of-sight ray: fallback if ground fix unavailable
@@ -7225,8 +7252,11 @@ int run_tracker_mode() {
                     const double dta = now - go_acc_t; go_acc_t = now;
                     if (args.go_accel_ff && dta > 0.01 && dta < 0.3 && go_have_prev_v) {
                         fl::Ned araw{(v.n - go_prev_v.n) / dta, (v.e - go_prev_v.e) / dta, (v.d - go_prev_v.d) / dta};
-                        const double am = std::sqrt(araw.n * araw.n + araw.e * araw.e + araw.d * araw.d);
                         const double a_max = (args.camera_mount == "body") ? 5.5 : ((args.zero_decel || args.fpv_shoot) ? 25.0 : std::max(20.0, args.goto_accel * 1.5));
+                        const double a_h_max = (args.camera_mount == "body") ? (9.81 * std::tan(fl::deg2rad(30.0))) : a_max;
+                        const double ah = std::hypot(araw.n, araw.e);
+                        if (ah > a_h_max) { araw.n *= a_h_max / ah; araw.e *= a_h_max / ah; }
+                        const double am = std::sqrt(araw.n * araw.n + araw.e * araw.e + araw.d * araw.d);
                         if (am > a_max) { araw.n *= a_max / am; araw.e *= a_max / am; araw.d *= a_max / am; }
                         const double k = dta / (0.15 + dta);
                         go_acc_f = fl::Ned{go_acc_f.n + k * (araw.n - go_acc_f.n), go_acc_f.e + k * (araw.e - go_acc_f.e), go_acc_f.d + k * (araw.d - go_acc_f.d)};

@@ -19,8 +19,10 @@ WP_ACC 15
 WP_ACC_Z 6
 # jerk m/s/s/s (default 1)
 WP_JERK 30
-# tilt limit, degrees (default 30; fast.parm 55): lean = acceleration and top speed
-ATC_ANGLE_MAX 45
+# tilt limit, degrees (30 deg keeps fixed camera looking forward/down at the target without pitch-down blindness)
+ATC_ANGLE_MAX 30
+# Disable crash check failsafe so motors stay powered through contact with the target
+FS_CRASH_CHECK 0
 # attitude response time constant s (default 0.15): snappier
 ATC_INPUT_TC 0.15
 # how fast the position controller may change acceleration (default 5 / 5 m/s/s/s)
