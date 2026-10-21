@@ -1453,9 +1453,9 @@ struct Ned { double n = 0, e = 0, d = 0; };                       // metres from
 // Ground position of the tracked point, assuming flat ground under it. bearing_right: + clockwise from the airframe nose;
 // depression: angle below the horizontal of the line of sight; height: vehicle height above the tracked point.
 inline bool target_ned_from_view(const Ned& veh, double veh_yaw_rad, double height_m, double bearing_right_rad, double depression_rad,
-                                 double min_depression_rad, Ned& out) {
-    if (depression_rad < min_depression_rad || height_m < 0.5) return false;                 // too shallow: the distance is not trustworthy
-    double dist = height_m / std::tan(depression_rad);
+                                 double min_depression_rad, Ned& out, double min_height_m = 0.5) {
+    if (depression_rad < min_depression_rad || height_m < min_height_m) return false;                 // too shallow or below floor
+    double dist = (depression_rad > 1e-4) ? (height_m / std::tan(depression_rad)) : 0.0;
     double hdg = veh_yaw_rad + bearing_right_rad;
     out.n = veh.n + dist * std::cos(hdg); out.e = veh.e + dist * std::sin(hdg); out.d = veh.d + height_m;
     return true;
@@ -2052,7 +2052,7 @@ inline Ned go_velocity(int mode, const Ned& veh, const Ned& v_veh, const Ned& tg
         // True 3D Proportional Navigation: nullifies line-of-sight rotation rate vector in 3D space
         const double rn = tgt.n - veh.n, re = tgt.e - veh.e, rd = tgt.d - veh.d;
         const double r2 = rn * rn + re * re + rd * rd, r = std::sqrt(r2);
-        if (r > 0.5) {
+        if (r > 0.05) {
             const double un = rn / r, ue = re / r, ud = rd / r;
             // Target relative velocity to vehicle in 3D NED coordinates
             const double vtn = v_tgt.n - v_veh.n, vte = v_tgt.e - v_veh.e, vtd = v_tgt.d - v_veh.d;
@@ -4345,7 +4345,7 @@ void apply_profile(Args& a, const std::string& p) {
         // sim_up.sh --fpv-camera: an FPV drone -- the same 1280x720 ~100 deg camera, but FIXED to the airframe, tilted --cam-pitch-deg
         // (sim_up.sh FPV_CAM_PITCH, default -15) and no gimbal: the drone itself turns to centre the target sideways and climbs /
         // descends to hold it vertically (on the depression below the horizon: fl::body_cam_vertical_error), at FPV speed
-        if (p == "sim-fpv") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.video_latency = 0.0;
+        if (p == "sim-fpv") { a.hfov_deg = 100.0; a.track_scale = 0.5; a.cam_w = 1280; a.cam_h = 720; a.video_latency = 0.2;
                               a.gimbal_centre = false; a.yaw_ff_mode = "world"; a.kyaw = 3.0; a.zoom_max = 1.0;
                               apply_fpv_flight(a); }
     } else if (p == "real-fpv") {
@@ -6434,49 +6434,54 @@ int run_tracker_mode() {
                     }
                 }
             }
-            // 3D destination is centered directly on the selected object (not below in the dirt, not above)
-            const double height = std::max(0.1, h_ground - std::max(0.0, live_target_h) * 0.5);
-            fl::ViewAngles va; bool have_va = false;
-            if (gimbal_mode) { if (gimbal_fresh) { va = fl::view_angles(0, 0, 1, 1, gimbal_yaw, gimbal_pitch, stabilized, vs.pitch, vs.roll); have_va = true; } }
-            else if (tracking && cam_known) {
+            fl::ViewAngles va_bot{}, va_cen{}, va{};
+            bool have_va = false;
+            if (gimbal_mode) {
+                if (gimbal_fresh) {
+                    va = fl::view_angles(0, 0, 1, 1, gimbal_yaw, gimbal_pitch, stabilized, vs.pitch, vs.roll);
+                    va_bot = va;
+                    va_cen = va;
+                    have_va = true;
+                }
+            } else if (tracking && cam_known) {
                 const fl::Box sb = kf.box();
-                const double py = (args.centre_target || args.go_through) ? sb.cy() : (sb.y + sb.h);
-                va = fl::view_angles(sb.cx() - K.cx, py - K.cy, K.fx, K.fy, cam_yaw, cam_pitch, stabilized, ps.pitch, ps.roll); have_va = true;
+                va_bot = fl::view_angles(sb.cx() - K.cx, (sb.y + sb.h) - K.cy, K.fx, K.fy, cam_yaw, cam_pitch, stabilized, ps.pitch, ps.roll);
+                va_cen = fl::view_angles(sb.cx() - K.cx, sb.cy() - K.cy, K.fx, K.fy, cam_yaw, cam_pitch, stabilized, ps.pitch, ps.roll);
+                va = (args.centre_target || args.go_through) ? va_cen : va_bot;
+                have_va = true;
             }
-            if (have_va && !gimbal_mode) los_dep = va.depression;
+            if (have_va && !gimbal_mode) los_dep = va_cen.depression;
             if (args.gimbal_centre && now - gimbal_jump_at < args.gimbal_settle) have_va = false;
             if (have_va) {
-                tgt_ok = fl::target_ned_from_view(veh_then, ps.yaw, height, va.bearing_right, va.depression, fl::deg2rad(args.min_depression_deg), tgt);
-                tgt_sigma = fl::geometry_sigma(height, va.depression);
-                // 3D positioning from optical extent and line-of-sight ray: works anywhere in 3D space (ground, rooftop, airborne)
+                // Ground-referenced fix: project bottom of bounding box to ground, then offset to true target centroid
+                if (!gimbal_mode && va_bot.depression > fl::deg2rad(4.0) && h_ground > 0.05) {
+                    const double base_dist = h_ground / std::tan(va_bot.depression);
+                    const double hdg = ps.yaw + va_bot.bearing_right;
+                    const double half_depth = std::max(0.05, live_target_h * 0.5);
+                    tgt.n = veh_then.n + (base_dist + half_depth) * std::cos(hdg);
+                    tgt.e = veh_then.e + (base_dist + half_depth) * std::sin(hdg);
+                    tgt.d = (veh_then.d + h_ground) - half_depth;
+                    tgt_ok = true;
+                    tgt_sigma = fl::geometry_sigma(h_ground, va_bot.depression);
+                } else {
+                    const double height = std::max(0.05, h_ground - std::max(0.0, live_target_h) * 0.5);
+                    tgt_ok = fl::target_ned_from_view(veh_then, ps.yaw, height, va_cen.bearing_right, va_cen.depression, fl::deg2rad(args.min_depression_deg), tgt, 0.05);
+                    tgt_sigma = fl::geometry_sigma(height, va_cen.depression);
+                }
+                // 3D positioning from optical extent and line-of-sight ray: fallback if ground fix unavailable
                 if (!gimbal_mode && tracking && tracker_ok) {
                     const double hpx = kf.box().h;
-                    if (tgt_ok && va.depression >= fl::deg2rad(25.0)) size_rng.learn(height / std::sin(va.depression), hpx, K.fy, va.depression);
-                    if (size_rng.ready()) {
-                        const double slant = size_rng.slant(hpx, K.fy);
-                        const fl::Ned ray_tgt = fl::target_ned_from_ray(veh_then, ps.yaw, slant, va.bearing_right, va.depression);
-                        const double ss = fl::SizeRange::sigma(slant) * size_rng.angle_factor(va.depression);
-                        if (tgt_ok && va.depression >= fl::deg2rad(args.min_depression_deg)) {
-                            // Fuse ground-referenced fix and 3D ray fix along the line of sight
-                            const double wg = 1.0 / (tgt_sigma * tgt_sigma), ws = 1.0 / (ss * ss);
-                            tgt.n = (tgt.n * wg + ray_tgt.n * ws) / (wg + ws);
-                            tgt.e = (tgt.e * wg + ray_tgt.e * ws) / (wg + ws);
-                            tgt.d = (tgt.d * wg + ray_tgt.d * ws) / (wg + ws);
-                            tgt_sigma = 1.0 / std::sqrt(wg + ws);
-                        } else {
-                            // Airborne, rooftop, or shallow line-of-sight: purely 3D ray without ground constraint
-                            tgt = ray_tgt;
-                            tgt_sigma = ss;
-                            tgt_ok = true;
-                        }
+                    if (tgt_ok && va_bot.depression >= fl::deg2rad(20.0)) {
+                        const double slant_ground = (h_ground / std::sin(va_bot.depression)) + live_target_h * 0.5;
+                        size_rng.learn(slant_ground, hpx, K.fy, va_cen.depression);
                     }
-                }
-                // Penetrate from visible front surface to the 3D centroid of the target
-                if (tgt_ok && live_target_h > 0.0) {
-                    const double half_depth = live_target_h * 0.5;
-                    const double hdg = ps.yaw + va.bearing_right;
-                    tgt.n += half_depth * std::cos(hdg);
-                    tgt.e += half_depth * std::sin(hdg);
+                    if (size_rng.ready() && !tgt_ok) {
+                        const double slant = size_rng.slant(hpx, K.fy);
+                        const fl::Ned ray_tgt = fl::target_ned_from_ray(veh_then, ps.yaw, slant, va_cen.bearing_right, va_cen.depression);
+                        tgt = ray_tgt;
+                        tgt_sigma = fl::SizeRange::sigma(slant) * size_rng.angle_factor(va_cen.depression);
+                        tgt_ok = true;
+                    }
                 }
             }
         }
@@ -7070,8 +7075,9 @@ int run_tracker_mode() {
                     char bm[96]; std::snprintf(bm, sizeof bm, "GO: through the target at %.1f m/s -- braking", std::hypot(vs.vel[0], vs.vel[1]));
                     say(bm, SEV_INFO, "GO: through, braking");
                 }
+                const double to_look_h = std::hypot(look.n - veh_now.n, look.e - veh_now.e);
                 const double yaw_to = (args.go_through && (go_braking || past_m >= -3.0)) ? (go_braking ? go_brake_yaw : pass_yaw)
-                    : std::hypot(look.n - veh_now.n, look.e - veh_now.e) > 0.05 ? fl::bearing_to(veh_now, look) : vs.yaw;
+                    : to_look_h > 1.0 ? fl::bearing_to(veh_now, look) : pass_yaw;
                 const double v_now = std::sqrt(vs.vel[0] * vs.vel[0] + vs.vel[1] * vs.vel[1] + vs.vel[2] * vs.vel[2]);
                 // guidance (--go-guidance): against a MOVING target the approach is relative to it -- see fl::go_velocity. The target's
                 // velocity and its turn-aware future come from the IMM-UKF track; without a valid track: the previous pursuit law.
@@ -7174,7 +7180,7 @@ int run_tracker_mode() {
                     if (args.go_accel_ff && dta > 0.01 && dta < 0.3 && go_have_prev_v) {
                         fl::Ned araw{(v.n - go_prev_v.n) / dta, (v.e - go_prev_v.e) / dta, (v.d - go_prev_v.d) / dta};
                         const double am = std::sqrt(araw.n * araw.n + araw.e * araw.e + araw.d * araw.d);
-                        const double a_max = (args.zero_decel || args.fpv_shoot) ? 25.0 : std::max(20.0, args.goto_accel * 1.5);
+                        const double a_max = (args.camera_mount == "body") ? 5.5 : ((args.zero_decel || args.fpv_shoot) ? 25.0 : std::max(20.0, args.goto_accel * 1.5));
                         if (am > a_max) { araw.n *= a_max / am; araw.e *= a_max / am; araw.d *= a_max / am; }
                         const double k = dta / (0.15 + dta);
                         go_acc_f = fl::Ned{go_acc_f.n + k * (araw.n - go_acc_f.n), go_acc_f.e + k * (araw.e - go_acc_f.e), go_acc_f.d + k * (araw.d - go_acc_f.d)};
