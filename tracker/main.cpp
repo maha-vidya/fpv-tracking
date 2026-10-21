@@ -819,7 +819,7 @@ inline LockJob run_lock_job(cv::Mat frame, cv::Mat prev, double scale, double px
         // snapped to the box -- the wrong object. Two similarly near candidates = ambiguous: refuse and ask for a direct click.
         if (cands.size() >= 2) {
             const double d0 = std::hypot(cands[0].x - px, cands[0].y - py), d1 = std::hypot(cands[1].x - px, cands[1].y - py);
-            if (d1 < 1.5 * d0) { j.why = "two objects near the click -- click directly on the one you want"; return j; }
+            if (d0 > 15.0 && d1 < 1.25 * d0) { j.why = "two objects near the click -- click directly on the one you want"; return j; }
         }
         for (size_t k = 0; k < cands.size() && k < 1; k++) {
             std::string why2, how2; Box b2;
@@ -1637,6 +1637,11 @@ public:
     explicit RescueController(RescueCfg c = RescueCfg()) : cfg_(c) { st_ = cfg_.enabled ? RState::IDLE : RState::DISABLED; }
     RState state() const { return st_; }
     const RescueCfg& cfg() const { return cfg_; }
+    void reset() {
+        if (st_ != RState::DISABLED) st_ = RState::IDLE;
+        end_ = REnd::NONE;
+        armed_at_ = 0;
+    }
 
     RescueOut step(const RescueIn& in) {
         RescueOut o; o.state = st_; o.end = end_;
@@ -3265,8 +3270,19 @@ public:
     fl::Ned stop_point(double decel = 2.5) const { std::lock_guard<std::mutex> lk(mtx_); return stop_point_locked(decel); }
     void cancel_goto(bool hold_here = true) {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (goto_active_ && goto_has_vel_ && hold_here && vs_.pos_valid) { hold_pending_ = true; hold_at_ = stop_point_locked(); hold_yaw_ = vs_.yaw; }
+        if (goto_active_ && goto_has_vel_ && hold_here && vs_.pos_valid) {
+            hold_pending_ = true; hold_at_ = stop_point_locked(); hold_yaw_ = vs_.yaw;
+        } else {
+            hold_pending_ = false;
+        }
         goto_active_ = false; goto_has_vel_ = false;
+    }
+    void clear_hold() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        hold_pending_ = false;
+        stop_pending_ = false;
+        goto_active_ = false;
+        goto_has_vel_ = false;
     }
     // One-shot safety mode change (BRAKE on abort, LOITER on lock loss): fires DO_SET_MODE 3x with the command protocol's
     // incrementing confirm field for UDP reliability, then returns -- unlike request_guided() this does not wait for or track
@@ -5828,21 +5844,29 @@ int run_tracker_mode() {
     std::optional<fl::Box> pending_box; double pending_since = 0; bool pending_point = false; int click_dbg_n = 0;
     std::string run_tag; { char tb[32]; std::time_t tt = std::time(nullptr); std::tm tmv; localtime_r(&tt, &tmv); std::strftime(tb, sizeof tb, "%H%M%S", &tmv); run_tag = tb; }   // debug image names per run
     std::future<fl::LockJob> lock_job; bool lock_job_running = false; bool pending_preseg = false; cv::Point2d click_rel(-1, -1); double lock_t = -1e9;
-    auto select_rect = [&](const fl::Box& b, double t) { pending_box = b; pending_point = false; pending_preseg = false; pending_since = t; ++lock_gen; };       // select received, waiting for GUIDED
+    bool goto_path_active = false, goto_sent = false;
+    auto select_rect = [&](const fl::Box& b, double t) {
+        if (goto_path_active || goto_sent) {
+            link->cancel_goto(false); link->clear_hold();
+            goto_path_active = false; goto_sent = false;
+        }
+        pending_box = b; pending_point = false; pending_preseg = false; pending_since = t; ++lock_gen;
+    };
     fl::Box box;                                                         // last ACCEPTED tracker box (full-frame px)
     double lock_dep = std::numeric_limits<double>::quiet_NaN();           // FPV (fixed camera): the target's depression at lock
     double vert_err_f = 0, vert_err_t = 0;                                  // FPV centring: the smoothed vertical error (rad) and its time
     double last_accept = now_s(), ref_h = 0, last_reject_log = 0; bool tracking = false; std::vector<double> settle;
     cv::Scalar ref_color(-1, -1, -1);   // mean BGR of the box at lock time, for the appearance cross-check (fl::color_plausible)
-    bool rc_lock_armed = true, prev_session = false, goto_sent = false;   // goto_sent: once a go-to fires, the normal follow-velocity
-                                                                            // control stops (one go-to command is the whole job; it must
-                                                                            // not be fought by a concurrent 20 Hz velocity session)
+    bool rc_lock_armed = true, prev_session = false;
+    // goto_sent: once a go-to fires, the normal follow-velocity
+    // control stops (one go-to command is the whole job; it must
+    // not be fought by a concurrent 20 Hz velocity session)
     // Diagonal pacing: the destination is fixed at confirm time (no re-targeting), but instead of sending it once and trusting
     // ArduPilot's own path shape, we send a moving point along the straight 3D line to it, paced so horizontal and vertical
     // progress stay equal -- found live in SITL that a single position target made ArduPilot descend almost fully before
     // translating (even with WP_SPD_UP/DN raised to match the horizontal speed): this paces it ourselves instead.
     fl::Ned pursuit_tgt{}, pursuit_last{}; double pursuit_seen = 0, pursuit_floor_d = 0; bool pursuit_arrived = false;   // GO pursuit
-    bool goto_path_active = false; fl::Ned goto_start{}, goto_final{}, goto_hold{}; double goto_along = 0, goto_prev_t = 0, goto_total = 0;
+    fl::Ned goto_start{}, goto_final{}, goto_hold{}; double goto_along = 0, goto_prev_t = 0, goto_total = 0;
     const int go_guidance_mode = args.go_guidance == "lead" ? 1 : args.go_guidance == "intercept" ? 2 : args.go_guidance == "pn" ? 3 : 0;
     fl::TargetEstimator tgt_est(args.est_q_acc);
     fl::SizeRange size_rng;                         // range from the box size, learned per target (see fl::SizeRange)   // the target's ground position + velocity (feed-forward, lead, stay-over)
@@ -5943,6 +5967,11 @@ int run_tracker_mode() {
         select_point_on(x, y, tf, f);
     };
     select_point_on = [&](double x, double y, double tf, cv::Mat f) {
+        if (goto_path_active || goto_sent) {
+            link->cancel_goto(false); link->clear_hold();
+            goto_path_active = false; goto_sent = false;
+            link->command(fl::Cmd(), false);
+        }
         cv::Mat prev;                                                     // ~3 frames before it, at the tracking scale (motion region)
         for (auto it = frame_hist.rbegin(); it != frame_hist.rend(); ++it) if (it->first <= tf - 2.5 * std::max(0.03, nominal_gap)) { prev = it->second.clone(); break; }
         lock_job = std::async(std::launch::async, fl::run_lock_job, f.clone(), prev, std::min(1.0, args.track_scale), x, y, 0.07 * W, tf);
@@ -6189,8 +6218,24 @@ int run_tracker_mode() {
                                           // otherwise fight the follow velocities at 1 Hz) and restart the velocity session, which
                                           // the dash ended -- the FSM may have stayed non-IDLE throughout, so the session-edge
                                           // logic below would never restart it on its own.
-                                          link->cancel_goto(); goto_path_active = false;
-                                          if (prev_session) link->begin_session();
+                                          link->cancel_goto(false); link->clear_hold(); goto_path_active = false;
+                                          link->begin_session();
+                                          pursuit_tgt = fl::Ned{}; pursuit_last = fl::Ned{};
+                                          goto_start = fl::Ned{}; goto_final = fl::Ned{}; goto_hold = fl::Ned{};
+                                          goto_along = 0; goto_total = 0;
+                                          pursuit_arrived = false; pursuit_static = false;
+                                          go_braking = false; go_punctured = false;
+                                          go_have_prev_v = false; go_prev_v = fl::Ned{}; go_acc_f = fl::Ned{};
+                                          size_rng.reset(); tgt_est.reset();
+                                          tgt_bearing_t = -1e9; tgt_bearing_prev = 0; tgt_world_rate = 0;
+                                          target_rate_f = 0; bearing_i.reset();
+                                          chase_since = 0; chase_last = fl::Cmd(); chase_last_t = -1e9; chase_vn = 0; chase_ve = 0;
+                                          sm_v = 0; sm_t = -1e9;
+                                          dist_f = -1; dist_t = -1e9;
+                                          view_vx = 0; view_vx_t = -1e9;
+                                          vert_err_f = 0; vert_err_t = -1e9;
+                                          view_ref_h = 0; view_goal_dist = 0; view_hold_dist = 0; view_approaching = false;
+                                          rescue.reset();
                                           lock_t = now; view_lock_alt = vs.alt_m; abort_latched = false;
                                           if (vs.mount_known) gimbal_cmd_pitch = vs.mount_pitch_deg + (args.mount_frame == "body" ? fl::rad2deg(vs.pitch) : 0.0);   // start the gimbal servo from where it is
                                           ref_color = fl::box_mean_color(frame, pb);
@@ -7050,6 +7095,7 @@ int run_tracker_mode() {
                 if (dest_ok && fsm.state() == fl::FState::LOCKED) { T = pursuit_tgt; fresh = true; }
                 else if (tgt_est.valid(now, 1.5)) { T = tgt_est.predict(now - tgt_est.last_fix()); if (!args.rescue_descend) T.d = veh_now.d; fresh = true; }
                 if (fresh) { pursuit_last = T; pursuit_seen = now; }
+                else if (T.n == 0 && T.e == 0 && T.d == 0) { T = veh_now; }
                 const fl::Ned E = fl::pursuit_point(veh_now, T, go_standoff, pursuit_floor_d, &goto_start);   // the stop point (signed offset)
                 // nose: at the target -- or, stopping PAST it (offset < 0), at the stop point: the same direction until the drone is over the
                 // target, but it does not whip round 180 deg as the drone flies over it
