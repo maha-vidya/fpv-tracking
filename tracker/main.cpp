@@ -69,7 +69,7 @@ constexpr double kStopOffset = 0.0;
 constexpr double kAccel = 5.5;
 // FLY THROUGH the target, true / false:
 //   true   accelerates all the way to the target and passes over it without braking, then brakes smoothly only after it is past.
-constexpr bool kFlyThrough = false;
+constexpr bool kFlyThrough = true;
 // Limits for run-time values (typos, a wrong QGC param): faster than kMaxSpeed or an offset beyond +-kMaxOffset is clamped.
 constexpr double kMaxSpeed = 40.0;
 constexpr double kMaxOffset = 100.0;
@@ -1992,16 +1992,13 @@ inline Ned pursuit_point(const Ned& veh, const Ned& tgt, double standoff, double
 }
 
 // GO pursuit velocity: straight at the end point at the GO speed, braking from the vehicle's ACTUAL distance so that it stops
-// there: v <= sqrt(2 a (d - v_now * lag)) -- the autopilot needs ~`lag` s to respond. When lag == 0 (direct contact/zero standoff),
-// maintains positive closing velocity all the way down to d < 0.05m to prevent premature stopping short of the target.
+// there: v <= sqrt(2 a (d - v_now * lag)) -- the autopilot needs ~`lag` s to respond. When lag <= 0 (direct contact/zero standoff),
+// maintains full cruise velocity all the way through the target to eliminate premature slowing down and stopping short.
 inline Ned pursuit_velocity(const Ned& veh, const Ned& end, double v_now, double speed, double acc, double lag) {
     const double dn = end.n - veh.n, de = end.e - veh.e, dd = end.d - veh.d, d = std::sqrt(dn * dn + de * de + dd * dd);
-    if (d < 0.05) return Ned{0, 0, 0};
+    if (d < 0.001) return Ned{0, 0, 0};
     const double d_eff = lag > 0.0 ? std::max(0.0, d - v_now * lag) : d;
-    double s = std::min(speed, std::sqrt(2.0 * acc * d_eff));
-    if (lag <= 0.0 && d > 0.05) {
-        s = std::min(speed, std::max(s, std::min(3.5, d * 4.0 + 1.0)));
-    }
+    const double s = (lag <= 0.0) ? speed : std::min(speed, std::sqrt(2.0 * acc * d_eff));
     return Ned{dn / d * s, de / d * s, dd / d * s};
 }
 
@@ -2068,7 +2065,8 @@ inline Ned go_velocity(int mode, const Ned& veh, const Ned& v_veh, const Ned& tg
         }
     }
     const double vm = std::sqrt(v.n * v.n + v.e * v.e + v.d * v.d);
-    if (vm > speed) { v.n *= speed / vm; v.e *= speed / vm; v.d *= speed / vm; }
+    if (eff_lag <= 0.0 && vm > 1e-4) { v.n *= speed / vm; v.e *= speed / vm; v.d *= speed / vm; }
+    else if (vm > speed) { v.n *= speed / vm; v.e *= speed / vm; v.d *= speed / vm; }
     return v;
 }
 
@@ -2873,6 +2871,8 @@ void test_chase() {
         v = pursuit_velocity(Ned{0, 0, -10}, Ned{2, 0, -10}, 4.0, 8.0, 4.0, 0.5); CHECK(v.n == 0.0);   // 2 m to go at 4 m/s: brake now
         v = pursuit_velocity(Ned{0, 0, -10}, Ned{3, 0, -6}, 0.0, 8.0, 4.0, 0.5); CHECK(v.d > 0); NEAR(v.n / v.d, 3.0 / 4.0, 1e-9);   // straight line (descending: NED d grows downward)
         v = pursuit_velocity(Ned{1, 1, -2}, Ned{1, 1, -2}, 0.0, 8.0, 4.0, 0.5); NEAR(std::hypot(v.n, v.e), 0.0, 1e-12);
+        // Direct contact / zero standoff (lag <= 0.0): maintains full cruise speed right through the target
+        v = pursuit_velocity(Ned{0, 0, -10}, Ned{0.5, 0, -10}, 8.0, 8.0, 4.0, 0.0); NEAR(v.n, 8.0, 1e-9);
     }
     e = pursuit_point(Ned{5, 5, -2}, Ned{5.5, 5, -2}, 1.0, 0.0); NEAR(e.n, 5.0, 1e-9); NEAR(e.e, 5.0, 1e-9);   // within 1 m: hold
     // pose history: interpolation, yaw across +-pi, gimbal yaw across +-180, outside the covered time -> false
@@ -6528,8 +6528,9 @@ int run_tracker_mode() {
             if (args.gimbal_centre && now - gimbal_jump_at < args.gimbal_settle) have_va = false;
             if (have_va) {
                 const double tgt_h = (live_target_h > 0.05) ? live_target_h : 1.0;
+                const double contact_h = std::clamp(tgt_h * 0.85, 0.85, std::max(0.85, tgt_h));
                 const double ground_d = veh_then.d + h_ground;
-                tgt.d = ground_d - 0.5 * tgt_h; // Target centroid in NED coordinates
+                tgt.d = ground_d - contact_h; // Aim at upper target face (z = 0.85-1.0m): landing gear clears asphalt completely
 
                 double dist_h = 0.0;
                 double hdg = ps.yaw + va_cen.bearing_right;
@@ -6551,7 +6552,7 @@ int run_tracker_mode() {
                 } else {
                     const double height = std::max(0.05, h_ground - std::max(0.0, live_target_h) * 0.5);
                     tgt_ok = fl::target_ned_from_view(veh_then, ps.yaw, height, va_cen.bearing_right, va_cen.depression, fl::deg2rad(args.min_depression_deg), tgt, 0.05);
-                    tgt.d = ground_d - 0.5 * tgt_h;
+                    tgt.d = ground_d - contact_h;
                     tgt_sigma = fl::geometry_sigma(height, va_cen.depression);
                 }
                 // 3D positioning from optical extent and line-of-sight ray: fallback if ground fix unavailable
@@ -7162,19 +7163,11 @@ int run_tracker_mode() {
                     char bm[96]; std::snprintf(bm, sizeof bm, "GO: through the target at %.1f m/s -- braking", std::hypot(vs.vel[0], vs.vel[1]));
                     say(bm, SEV_INFO, "GO: through, braking");
                 }
-                const double to_look_h = std::hypot(look.n - veh_now.n, look.e - veh_now.e);
-                double target_yaw = (args.go_through && (go_braking || past_m >= -3.0)) ? (go_braking ? go_brake_yaw : pass_yaw) : pass_yaw;
-                if (!args.go_through || past_m < -3.0) {
-                    const double los_yaw = fl::bearing_to(veh_now, look);
-                    if (to_look_h >= 3.0) {
-                        target_yaw = los_yaw;
-                    } else if (to_look_h > 0.3) {
-                        const double w = (to_look_h - 0.3) / 2.7;
-                        const double diff = std::remainder(pass_yaw - los_yaw, 2.0 * M_PI);
-                        target_yaw = los_yaw + (1.0 - w) * diff;
-                    } else {
-                        target_yaw = pass_yaw;
-                    }
+                double target_yaw = pass_yaw;
+                if (past_m < 0.0) {
+                    target_yaw = fl::bearing_to(veh_now, look);
+                } else if (go_braking) {
+                    target_yaw = go_brake_yaw;
                 }
                 if (!go_have_prev_yaw) { go_prev_yaw = vs.yaw; go_have_prev_yaw = true; }
                 const double dts_yaw = std::clamp(now - go_yaw_t, 0.01, 0.2); go_yaw_t = now;
@@ -7221,32 +7214,29 @@ int run_tracker_mode() {
                             vd_cmd += 1.5 * (d_path - veh_now.d);
                         }
 
-                        // Ground clearance and target centroid ceiling:
-                        // In NED, d is positive downward.
+                        // Ground clearance and target centroid ceiling (no artificial landing speed restriction):
                         const bool is_dive = (T.d >= goto_start.d);
                         if (is_dive) {
                             if (veh_now.d >= T.d) {
                                 vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
-                            } else if (vd_cmd > 0.0) {
-                                const double max_allowed_vd = std::max(0.0, (T.d - veh_now.d) / 0.4);
-                                vd_cmd = std::min(vd_cmd, max_allowed_vd);
                             }
                         } else {
                             if (veh_now.d <= T.d) {
                                 vd_cmd = std::max(0.0, (T.d - veh_now.d) * 2.0);
-                            } else if (vd_cmd < 0.0) {
-                                const double min_allowed_vd = std::min(0.0, (T.d - veh_now.d) / 0.4);
-                                vd_cmd = std::max(vd_cmd, min_allowed_vd);
                             }
                         }
                         v.d = std::clamp(vd_cmd, -args.ceil_vz, args.ceil_vz);
                     } else {
                         v.d = std::clamp((T.d - veh_now.d) * 2.0, -args.ceil_vz, args.ceil_vz);
                     }
+                    if (go_standoff <= 0.0 && past_m >= 0.0) {
+                        v.n = un * go_speed;
+                        v.e = ue * go_speed;
+                    }
                 } else if (!go_braking) {
-                    if (past_m < 0) {
-                        // Approach: proportional navigation straight onto collision course with the target aperture
-                        v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, -1000.0, pass_d, go_speed, args.goto_accel, 0.0, args.pn_gain, &goto_start);
+                    if (past_m < 0.0) {
+                        // Approach: true 3D proportional navigation collision course straight onto the target
+                        v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, 0.0, pass_d, go_speed, args.goto_accel, 0.0, args.pn_gain, &goto_start);
                         const double dn_to_t = T.n - veh_now.n;
                         const double de_to_t = T.e - veh_now.e;
                         const double dh_to_t = std::hypot(dn_to_t, de_to_t);
@@ -7264,20 +7254,12 @@ int run_tracker_mode() {
                             const bool is_dive = (T.d >= goto_start.d);
                             if (is_dive) {
                                 if (veh_now.d >= T.d) vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
-                                else if (vd_cmd > 0.0) vd_cmd = std::min(vd_cmd, std::max(0.0, (T.d - veh_now.d) / 0.4));
                             } else {
                                 if (veh_now.d <= T.d) vd_cmd = std::max(0.0, (T.d - veh_now.d) * 2.0);
-                                else if (vd_cmd < 0.0) vd_cmd = std::max(vd_cmd, std::min(0.0, (T.d - veh_now.d) / 0.4));
                             }
                             v.d = std::clamp(vd_cmd, -args.ceil_vz, args.ceil_vz);
                         } else {
                             v.d = std::clamp((T.d - veh_now.d) * 2.0, -args.ceil_vz, args.ceil_vz);
-                        }
-                        // Within 3m of entry: smoothly lock forward velocity onto the pass vector for a razor-straight aperture transit
-                        if (past_m >= -3.0) {
-                            const double w = std::clamp((past_m + 3.0) / 3.0, 0.0, 1.0);
-                            v.n = (1.0 - w) * v.n + w * (un * go_speed);
-                            v.e = (1.0 - w) * v.e + w * (ue * go_speed);
                         }
                     } else {
                         // Through & past: maintain constant cinematic flight speed straight through the negative space / interior geometry
