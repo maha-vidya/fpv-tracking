@@ -7222,14 +7222,22 @@ int run_tracker_mode() {
                         }
 
                         // Ground clearance and target centroid ceiling:
-                        // In NED, d is positive downward. If vehicle altitude reaches or descends below
-                        // the target centroid (veh_now.d >= T.d), NEVER command downward descent (vd_cmd <= 0).
-                        // Level off cleanly at target height directly into the target face.
-                        if (veh_now.d >= T.d) {
-                            vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
-                        } else if (vd_cmd > 0.0) {
-                            const double max_allowed_vd = std::max(0.0, (T.d - veh_now.d) / 0.4);
-                            vd_cmd = std::min(vd_cmd, max_allowed_vd);
+                        // In NED, d is positive downward.
+                        const bool is_dive = (T.d >= goto_start.d);
+                        if (is_dive) {
+                            if (veh_now.d >= T.d) {
+                                vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
+                            } else if (vd_cmd > 0.0) {
+                                const double max_allowed_vd = std::max(0.0, (T.d - veh_now.d) / 0.4);
+                                vd_cmd = std::min(vd_cmd, max_allowed_vd);
+                            }
+                        } else {
+                            if (veh_now.d <= T.d) {
+                                vd_cmd = std::max(0.0, (T.d - veh_now.d) * 2.0);
+                            } else if (vd_cmd < 0.0) {
+                                const double min_allowed_vd = std::min(0.0, (T.d - veh_now.d) / 0.4);
+                                vd_cmd = std::max(vd_cmd, min_allowed_vd);
+                            }
                         }
                         v.d = std::clamp(vd_cmd, -args.ceil_vz, args.ceil_vz);
                     } else {
@@ -7253,8 +7261,14 @@ int run_tracker_mode() {
                             const double los_slope = (T.d - veh_now.d) / dh_to_t;
                             double vd_cmd = vh_cmd * los_slope;
                             if (init_dh > 0.5) vd_cmd += 1.5 * (d_path - veh_now.d);
-                            if (veh_now.d >= T.d) vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
-                            else if (vd_cmd > 0.0) vd_cmd = std::min(vd_cmd, std::max(0.0, (T.d - veh_now.d) / 0.4));
+                            const bool is_dive = (T.d >= goto_start.d);
+                            if (is_dive) {
+                                if (veh_now.d >= T.d) vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
+                                else if (vd_cmd > 0.0) vd_cmd = std::min(vd_cmd, std::max(0.0, (T.d - veh_now.d) / 0.4));
+                            } else {
+                                if (veh_now.d <= T.d) vd_cmd = std::max(0.0, (T.d - veh_now.d) * 2.0);
+                                else if (vd_cmd < 0.0) vd_cmd = std::max(vd_cmd, std::min(0.0, (T.d - veh_now.d) / 0.4));
+                            }
                             v.d = std::clamp(vd_cmd, -args.ceil_vz, args.ceil_vz);
                         } else {
                             v.d = std::clamp((T.d - veh_now.d) * 2.0, -args.ceil_vz, args.ceil_vz);
