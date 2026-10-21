@@ -7194,21 +7194,70 @@ int run_tracker_mode() {
                 if (!args.go_through) {
                     const double eff_lag = (go_standoff <= 0.0) ? 0.0 : 0.5;
                     v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, go_standoff, pursuit_floor_d, go_speed, args.goto_accel, eff_lag, args.pn_gain, &goto_start);
+                    // Glide-slope coupling: slave vertical descent to actual horizontal closure
+                    // Multirotors accelerate downward under gravity (g = 9.81 m/s^2) almost instantaneously,
+                    // while horizontal acceleration requires attitude tilt (max 30 deg, a_h <= 5.6 m/s^2) which
+                    // takes time to develop. Without slaving, the drone drops vertically faster than it translates,
+                    // falling below the line of sight and striking the ground short of the target.
+                    const double dn_to_t = T.n - veh_now.n;
+                    const double de_to_t = T.e - veh_now.e;
+                    const double dh_to_t = std::hypot(dn_to_t, de_to_t);
+                    const double vh_cmd = std::hypot(v.n, v.e);
+
                     if (args.fixed_horizontal || !args.rescue_descend) {
                         v.d = 0.0;
-                    } else if (std::abs(v.d) > args.ceil_vz) {
-                        const double s_vz = args.ceil_vz / std::abs(v.d);
-                        v.n *= s_vz; v.e *= s_vz; v.d = std::clamp(v.d, -args.ceil_vz, args.ceil_vz);
+                    } else if (dh_to_t > 0.05) {
+                        // Nominal 3D glide slope from initial dash position (goto_start) to target centroid (T)
+                        const double init_dh = std::hypot(T.n - goto_start.n, T.e - goto_start.e);
+                        const double rho = init_dh > 0.5 ? std::clamp(dh_to_t / init_dh, 0.0, 1.0) : 0.0;
+                        const double d_path = T.d - rho * (T.d - goto_start.d);
+
+                        // Feedforward descent velocity locked 1:1 with horizontal speed along LOS slope
+                        const double los_slope = (T.d - veh_now.d) / dh_to_t;
+                        double vd_cmd = vh_cmd * los_slope;
+
+                        // Glide path altitude regulation: pull back onto ideal line if perturbed
+                        if (init_dh > 0.5) {
+                            vd_cmd += 1.5 * (d_path - veh_now.d);
+                        }
+
+                        // Ground clearance and target centroid ceiling:
+                        // In NED, d is positive downward. If vehicle altitude reaches or descends below
+                        // the target centroid (veh_now.d >= T.d), NEVER command downward descent (vd_cmd <= 0).
+                        // Level off cleanly at target height directly into the target face.
+                        if (veh_now.d >= T.d) {
+                            vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
+                        } else if (vd_cmd > 0.0) {
+                            const double max_allowed_vd = std::max(0.0, (T.d - veh_now.d) / 0.4);
+                            vd_cmd = std::min(vd_cmd, max_allowed_vd);
+                        }
+                        v.d = std::clamp(vd_cmd, -args.ceil_vz, args.ceil_vz);
+                    } else {
+                        v.d = std::clamp((T.d - veh_now.d) * 2.0, -args.ceil_vz, args.ceil_vz);
                     }
                 } else if (!go_braking) {
                     if (past_m < 0) {
                         // Approach: proportional navigation straight onto collision course with the target aperture
                         v = fl::go_velocity(trk ? go_guidance_mode : 0, veh_now, vveh, T, vt, predict, -1000.0, pass_d, go_speed, args.goto_accel, 0.0, args.pn_gain, &goto_start);
+                        const double dn_to_t = T.n - veh_now.n;
+                        const double de_to_t = T.e - veh_now.e;
+                        const double dh_to_t = std::hypot(dn_to_t, de_to_t);
+                        const double vh_cmd = std::hypot(v.n, v.e);
+
                         if (args.fixed_horizontal || !args.rescue_descend) {
                             v.d = 0.0;
-                        } else if (std::abs(v.d) > args.ceil_vz) {
-                            const double s_vz = args.ceil_vz / std::abs(v.d);
-                            v.n *= s_vz; v.e *= s_vz; v.d = std::clamp(v.d, -args.ceil_vz, args.ceil_vz);
+                        } else if (dh_to_t > 0.05) {
+                            const double init_dh = std::hypot(T.n - goto_start.n, T.e - goto_start.e);
+                            const double rho = init_dh > 0.5 ? std::clamp(dh_to_t / init_dh, 0.0, 1.0) : 0.0;
+                            const double d_path = T.d - rho * (T.d - goto_start.d);
+                            const double los_slope = (T.d - veh_now.d) / dh_to_t;
+                            double vd_cmd = vh_cmd * los_slope;
+                            if (init_dh > 0.5) vd_cmd += 1.5 * (d_path - veh_now.d);
+                            if (veh_now.d >= T.d) vd_cmd = std::min(0.0, (T.d - veh_now.d) * 2.0);
+                            else if (vd_cmd > 0.0) vd_cmd = std::min(vd_cmd, std::max(0.0, (T.d - veh_now.d) / 0.4));
+                            v.d = std::clamp(vd_cmd, -args.ceil_vz, args.ceil_vz);
+                        } else {
+                            v.d = std::clamp((T.d - veh_now.d) * 2.0, -args.ceil_vz, args.ceil_vz);
                         }
                         // Within 3m of entry: smoothly lock forward velocity onto the pass vector for a razor-straight aperture transit
                         if (past_m >= -3.0) {
@@ -7298,12 +7347,18 @@ int run_tracker_mode() {
                 // nothing fresh for 3 s: stop re-aiming and hold the last point (the vehicle is not sent after a stale guess)
                 // ... unless the target was STATIC: its last position is still where it is, so the dash carries on to it
                 if (fresh) pursuit_static = !tgt_est.valid(now, 1.5) || std::hypot(tgt_est.vn(), tgt_est.ve()) < 0.5;
-                // [GO-8] STOPPING (4/4) -- target not seen for 3 s: hold the last target point instead of braking short.
-                if (goto_path_active && !(args.go_through && (go_braking || past_m >= -2.0)) && now - pursuit_seen > 3.0 && !pursuit_static) {
-                    goto_hold = fl::Ned{pursuit_last.n, pursuit_last.e, std::min(pursuit_last.d, pursuit_floor_d)};
-                    link->update_goto_point(goto_hold, vs.yaw);
-                    goto_path_active = false;
-                    say("GO-TO: target not seen for 3 s -- holding target point", SEV_WARN, "GO-TO: target lost, holding target");
+                // [GO-8] STOPPING (4/4) -- if target is unseen during dash: continue dash directly to pursuit_last until arrived!
+                if (goto_path_active && !(args.go_through && (go_braking || past_m >= -2.0)) && now - pursuit_seen > 3.0) {
+                    const double dist_to_last = std::hypot(pursuit_last.n - veh_now.n, pursuit_last.e - veh_now.e);
+                    if (dist_to_last < 0.8 || (pursuit_static && dist_to_last < 1.5)) {
+                        pursuit_arrived = true;
+                        goto_hold = fl::Ned{pursuit_last.n, pursuit_last.e, pursuit_last.d};
+                        link->update_goto_point(goto_hold, vs.yaw);
+                        goto_path_active = false;
+                        say("GO-TO arrived: reached target point", SEV_INFO, "GO-TO arrived");
+                        on_go_arrived(*link, veh_now, pursuit_last, 0.0);
+                    }
+                    // Otherwise continue the active dash straight to pursuit_last coordinates without cancelling
                 }
             } else if (goto_path_active) {
                 // Closed-loop homing: as long as the lock holds, keep refining the endpoint from the LIVE tracked box -- a single
