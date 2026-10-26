@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scripted Gazebo scenarios for the drone-with-camera follow/rescue project.
+"""Scripted Gazebo scenarios for the drone-with-camera follow/GO project.
 
 Spawns the actors a scenario needs (a person-like target in a red jacket, an orange-jacket lookalike, a wall
 that occludes) and moves them on a timeline, while firing pilot/environment events (mode change, RC switch,
@@ -16,7 +16,7 @@ horizontal FOV 2.0 rad (about 115 deg; ardupilot_gazebo gimbal_small_3d model.sd
 about +-23 m wide. Run simulation/sim_up.sh first. Drone truth is logged from Gazebo's pose topic.
 Truth CSV: $RUN_DIR/scenario_<name>_<time>.csv  (t, actor poses, drone pose).
 
-STATUS: written; see tracker/docs/RESCUE.md for what has and has not been exercised live.
+STATUS: written; see tracker/docs/GO.md for what has and has not been exercised live.
 """
 import argparse
 import csv
@@ -158,7 +158,7 @@ SCENARIOS = {
         events=[],
         expect="Forward command follows apparent size; box scale handled by CSRT."),
     "S8_dash": dict(
-        desc="Rescue dash: static target 25 m away; the pilot switch (RC ch9) is flipped up ONCE at t=20 s and held through the dash.", duration=60,
+        desc="GO dash: static target 25 m away; the pilot switch (RC ch9) is flipped up ONCE at t=20 s and held through the dash.", duration=60,
         actors={"target": static(0, 25)},
         events=[(20.0, "rc", dict(channel=9, pwm=1900, seconds=15.0))],   # back to low DURING a dash would BRAKE it
         expect="Interlocks pass, one switch flip fires GO; fast approach; stop; measure stop distance and overshoot."),

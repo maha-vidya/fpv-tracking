@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Spawn real OpenRobotics car/pedestrian mesh models (fetched from Gazebo Fuel, not flat colored boxes)
-in the running Gazebo world, on a simple cross-shaped road layout, for testing lock/follow/rescue accuracy
+in the running Gazebo world, on a simple cross-shaped road layout, for testing lock/follow/GO accuracy
 against several simultaneous targets moving in realistic, varied ways (not the single slow target
 move_target.py drives).
 

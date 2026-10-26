@@ -114,6 +114,9 @@ if b is None:
 trk.stdin.write("click %d %d\n" % (b[0] + b[2] // 2, b[1] + b[3] // 2)); trk.stdin.flush()
 time.sleep(25); results.append(measure("follow"))
 
+# GO is offered only with the '+' ON the target (inside its box for 0.3 s): wait for GO READY like a pilot would (up to 20 s more)
+t0 = time.time()
+while time.time() - t0 < 20 and not any("GO READY" in l for l in lines): time.sleep(0.2)
 phase[0] = "go"; n_before = len(lines)
 trk.stdin.write("go\n"); trk.stdin.flush(); time.sleep(15); results.append(measure("go"))
 go_lines = lines[n_before:]

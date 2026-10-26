@@ -47,9 +47,8 @@ The same program runs in a **simulator** on your laptop (Gazebo + ArduPilot) and
   click are "ground", the object is what differs), then **CSRT** tracks it frame to frame. A **Kalman filter** predicts
   where it moves; optional **DINOv2** (`--reid`) stops it from swapping onto a lookalike.
 - **Following with a fixed camera:** the camera is bolted to the frame, so the drone itself does the pointing — it yaws
-  to centre the target sideways and climbs/descends to put it **on the + (image centre)** (`--no-centre-target` turns this off).
-  The drone tracks and descends directly to the target object without artificial safety floors (`--alt-floor 0.0`). The drone's
-  own tilt is removed from the calculation, so leaning forward to speed up does not make it climb by mistake.
+  to centre the target sideways and climbs/descends to keep it where it was when you locked. The drone's own tilt is
+  removed from the calculation, so leaning forward to speed up does not make it climb by mistake.
 - **GO:** the target's real position on the ground is computed from the camera angle and the drone's height, and the
   drone flies straight at it at FPV speed (up to 25–30 m/s), re-aiming every frame so a moving target is chased.
 
@@ -154,38 +153,22 @@ cd ~/fpv-tracking/simulation && python3 spawn_traffic.py --cars 0 --people 0 --v
 **Step 4 — start the tracker** (a window opens with the drone's camera):
 
 ```bash
-cd ~/fpv-tracking/tracker && ./build/target_tracker --profile sim-fpv --enable-dash --video-out udp://127.0.0.1:5602
+cd ~/fpv-tracking/tracker && ./build/target_tracker --profile sim-fpv --enable-go --video-out udp://127.0.0.1:5602
 ```
 
-### Manual Verification Checklist (What to test)
+Now **click the red box** in the tracker window — a green box appears and the drone follows it. Press **G** to GO.
 
-1. **Single-Click Lock**: Click once anywhere on the red target box with the left mouse button (no box dragging required). The tracker immediately locks and draws a green bounding box around it.
-2. **Follow & High-Speed Agility**: Watch the drone dynamically turn and tilt to maintain the target in the center crosshairs while the target moves side-to-side.
-3. **GO Indication Check**:
-   - Check the top HUD banner: it turns bright green displaying:
-     `GO READY - PRESS G / CLICK GO (3D PN PREDICTION)`
-   - Check the companion window bottom button: the `GO` button lights up bright **GREEN**.
-4. **Trigger GO Dash**: Press **G** on the keyboard, or click the green **GO** button in the window.
-   - The HUD banner changes to:
-     `GO DASHING: 30 m/s | xx.x m TO TARGET [3D PN] | PRESS X TO ABORT`
-   - The GO button highlights in blue/cyan: `DASHING`.
-   - The drone accelerates at **10 m/s²** up to **30 m/s** using True 3D Proportional Navigation.
-   - **Proportional 3D Glide Slope**: The vertical descent is geometrically locked to forward closure ($v_d = v_h \cdot \frac{\Delta z}{D_h}$). Notice the drone intercepts the target **directly on the object** without diving into the ground early.
-5. **Arrival & Continuous Tracking**:
-   - Upon arrival directly at the object, the banner confirms:
-     `GO COMPLETE: TRACKING DIRECTLY ON TARGET - PRESS X TO DISENGAGE`
-   - The drone maintains continuous lock and tracks with the moving target.
-6. **Abort Test**: Press **X** or click **ABORT** at any time to verify the drone immediately disengages and climbs away safely.
+**Step 5 (optional) — QGroundControl:** open it; it connects by itself. For the GO / ABORT / LOCK buttons see
+[QGroundControl buttons](#qgroundcontrol-buttons).
 
-**Step 5 (optional) — QGroundControl:** open QGC; it connects automatically on UDP 14550. Import `tracker/qgc/FpvDashActions.json` to test the action buttons.
-
-**Turn everything off when finished:** press **Q** in the tracker window, **Ctrl+C** in any traffic terminal, then stop all background simulator processes:
+**Turn everything off:** press **Q** in the tracker window, **Ctrl+C** in the traffic terminal, then:
 
 ```bash
 cd ~/fpv-tracking/simulation && ./sim_down.sh
 ```
 
-> Always run `sim_down.sh` before starting `sim_up.sh` again. This terminates all background simulation PIDs and frees all network ports.
+> Always run `sim_down.sh` before starting `sim_up.sh` again. Two simulators running at once make objects jump
+> back and forth and send every message twice.
 
 ---
 
@@ -195,10 +178,11 @@ cd ~/fpv-tracking/simulation && ./sim_down.sh
 
 | To do this | Do this |
 |---|---|
-| Lock onto something | **Click** it once (no dragging required; auto-segments target) |
-| Lock onto what is in the middle of the picture | **L**, **S**, or **Space** |
+| Lock onto something | **Click** it |
+| Lock onto what is in the middle of the picture | **L** or **Space** |
+| Lock very precisely | **Drag** a box around it, then **S** |
 | Let go of the target | **U** |
-| **GO** — fly to the target (FPV Dash) | **G** (one press) |
+| **GO** — fly to the target | **G** (one press) |
 | ABORT — leave the target and climb to safety | **X** |
 | Show / hide the yellow "where it is going" box | **K** |
 | Quit | **Q** |
@@ -211,14 +195,14 @@ yellow box = predicted position · bottom line = drone speed, height, and the GO
 
 ### QGroundControl buttons
 
-Copy [`tracker/qgc/FpvDashActions.json`](tracker/qgc/FpvDashActions.json) into QGC's `MavlinkActions` folder
+Copy [`tracker/qgc/GoActions.json`](tracker/qgc/GoActions.json) into QGC's `MavlinkActions` folder
 (Linux: `~/Documents/QGroundControl/MavlinkActions`) and restart QGC. You get **Track LOCK**, **GO** (several
 variants), **ABORT**, **Track UNLOCK** and **BRAKE**. Edit the file to make your own GO buttons
 (`param1` = speed, `param2` = stop offset).
 
 ### RC switch (optional)
 
-`--rc-dash-channel N`: a switch on your transmitter. Flick it **up** = GO; back to **low** during the dash = stop
+`--rc-go-channel N`: a switch on your transmitter. Flick it **up** = GO; back to **low** during the dash = stop
 (BRAKE).
 
 ---
@@ -230,11 +214,11 @@ variants), **ABORT**, **Track UNLOCK** and **BRAKE**. Edit the file to make your
 | Offset | GO stops… |
 |---|---|
 | `10` | 10 m **before** the target |
-| `0` | **at** the target |
+| `0` | **at** the target (default) |
 | `-10` | **past** the target: flies over it and stops 10 m beyond |
 
-The stop point follows a moving target directly to its exact 3D coordinates. What happens when it
-arrives is your code: put it in `on_go_arrived()` in `tracker/main.cpp`.
+The stop point follows a moving target, and is never lower than `--alt-floor` above the ground. What happens when it
+arrives (landing, a release…) is your code: put it in `on_go_arrived()` in `tracker/main.cpp`.
 
 **Three ways to change speed and stop point** — pick whichever suits you:
 
@@ -246,13 +230,13 @@ arrives is your code: put it in `on_go_arrived()` in `tracker/main.cpp`.
    `param1` = speed, `param2` = offset.)
 2. **For this run** — add to the tracker command:
    ```
-   --dash-speed 15 --go-offset -10
+   --go-speed 15 --go-offset -10
    ```
 3. **Permanently** — edit the **`GO SETTINGS -- EDIT HERE`** block at the top of `tracker/main.cpp`:
    ```cpp
-   constexpr double kSpeed      = 30.0;   // GO speed, m/s (max 40)
-   constexpr double kStopOffset = 0.0;    // 0 at the target, +10 before, -10 past it
-   constexpr double kAccel      = 10.0;   // acceleration / braking rate, m/s² (10 m/s² high agility)
+   constexpr double kSpeed      = 25.0;   // GO speed, m/s
+   constexpr double kStopOffset = 0.0;    // +10 before the target, 0 at it, -10 past it
+   constexpr double kAccel      = 8.0;    // braking, m/s²
    ```
    then rebuild: `cd ~/fpv-tracking/tracker && cmake --build build -j`.
 
@@ -262,24 +246,17 @@ arrives is your code: put it in `on_go_arrived()` in `tracker/main.cpp`.
 **By default GO goes on one press.** Want a safety confirm? Start the tracker with `--go-confirm`: then the first press
 shows the distance and ETA, and a second press within 3 s confirms.
 
-**How you know GO is ready:** while a target is locked the tracker window shows **`GO READY - PRESS G / CLICK GO`** in bright green (with
-"3D PN PREDICTION" once it has worked out where the target is heading), or **`GO NOT READY: <reason>`** in yellow. During flight, it displays real-time speed and distance: **`GO DASHING: 30 m/s | 12.4 m TO TARGET [3D PN]`**. QGC gets
-the same as a message each time it changes.
-
-**Where GO aims:** by default (`--go-guidance pn`, proportional navigation) the drone matches the target's own speed and
-direction and steers to cancel any drift in the line of sight — that puts it on a collision course with where the target **will
-be**, not where it was. Its proportional 3D glide slope locks the vertical descent rate to horizontal closure ($v_d = v_h \cdot \frac{\Delta z}{D_h}$),
-guaranteeing arrival directly on the target object without premature diving or overshooting. Both ground and airborne targets are tracked via 3D optical ray geometry.
-
-**Before GO is accepted**, all of these must be true (otherwise it tells you which one failed): target locked (0 s wait),
-GUIDED mode, armed, link OK, GPS fix, EKF healthy, battery above the minimum, target within `--dash-max-range`.
+**Before GO is accepted** (otherwise it tells you which one failed): target locked for ≥ 0.5 s, GUIDED mode, armed, link OK,
+GPS fix, EKF healthy. No range or battery limit by default (FPV cinematic use): `--go-max-range M` and `--go-min-battery P` set
+them if you want them. Speed: `kSpeed` at the top of `tracker/main.cpp`; the real top speed is ArduPilot's `WP_SPD` in
+`simulation/fpv.parm`. GO flies to the target's current position and stops on its centre (`kStopOffset = 0`).
 
 ---
 
 ## 7. Run it on the real drone
 
 ```bash
-./build/target_tracker --profile real-fpv --enable-dash \
+./build/target_tracker --profile real-fpv --enable-go \
   --connection serial:/dev/ttyAMA0:921600 --source 0 \
   --cam-pitch-deg -15 --hfov-deg 100
 ```
@@ -319,7 +296,7 @@ Pi 4 manages about 4–5 frames/s: add `--track-scale 0.33` and leave out `--rei
 | "lock refused" | Click directly on the object, not beside it. |
 | The box jumped onto the wrong object | Press **U**, click your object again. Try `--reid`. |
 | GO refused: "…" | The message says which check failed (not locked long enough, not GUIDED, no GPS…). |
-| `'g' has no effect: FPV dash is disabled` | Start the tracker with `--enable-dash`. |
+| `'g' has no effect: GO is disabled` | Start the tracker with `--enable-go`. |
 | The simulated drone crashed / fell over | `cd ~/fpv-tracking/simulation && python3 reset_drone.py` |
 | Real drone: "cannot open serial port" | Wrong device name — check `ls /dev/tty*` and pass `--connection serial:/dev/<port>:921600`. |
 
@@ -351,9 +328,9 @@ fpv-tracking/
 │   ├── native_ai.hpp        optional DINOv2 lookalike check (OpenVINO)
 │   ├── detector_sidecar.py  the same check as a Python helper, for builds without OpenVINO
 │   ├── scripts/             build.sh, fetch_mavlink.sh, run scripts for laptop / Jetson
-│   ├── qgc/FpvDashActions.json  QGroundControl buttons
+│   ├── qgc/GoActions.json   QGroundControl buttons
 │   ├── tests/               offline benchmarks (lock and tracking on recorded clips)
-│   └── docs/                FPV_DASH.md (detailed reference), VERIFICATION.md
+│   └── docs/                GO.md (detailed reference), VERIFICATION.md
 └── simulation/              testing tools only — nothing here runs on the drone
     ├── sim_up.sh / sim_down.sh / sim_status.sh   start / stop / check the whole simulator
     ├── fpv.parm, fast.parm  ArduPilot speed limits for the simulator
@@ -364,7 +341,7 @@ fpv-tracking/
 ```
 
 The program also still supports a gimbal camera (SkyDroid C12: `--profile real-c12`, `sim-c12cam`); the FPV profiles
-don't use it. All options: `tracker/docs/FPV_DASH.md`.
+don't use it. All options: `tracker/docs/GO.md`.
 
 ---
 
@@ -376,5 +353,5 @@ don't use it. All options: `tracker/docs/FPV_DASH.md`.
   on arrival is your own code (`on_go_arrived()`).
 - Following is gated: commands are sent only while GUIDED, armed, linked and actually locked; speeds are capped.
 - A lost target → the drone stops and hovers. ABORT → it climbs away and holds.
-- FPV speeds (25–30 m/s) and dash acceleration (10 m/s²) are fast. Test in the simulator first, then on the real drone with low speeds
-  (`--dash-speed 5 --ceil-vx 5`) before raising them.
+- FPV speeds (25–30 m/s) are fast. Test in the simulator first, then on the real drone with low speeds
+  (`--go-speed 5 --ceil-vx 5`) before raising them.

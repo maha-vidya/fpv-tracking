@@ -50,7 +50,7 @@ prints "the link keeps reconnecting -- is ANOTHER target_tracker running?".
 | Zoom control (manual) | PENDING / not implemented | No pilot zoom command; the C12 optical zoom is not wired. |
 | Zoom according to target size | PASS | 12 view decisions in 30 s. |
 | Zoom limits | PASS | 1.00–1.25 (cap 2.0). |
-| Tracker after zoom | PARTIAL | The box is carried with the predicted motion; zoom only while steady. Earlier, 1 rescue run in 3 lost the lock during approach + zoom. |
+| Tracker after zoom | PARTIAL | The box is carried with the predicted motion; zoom only while steady. Earlier, 1 GO run in 3 lost the lock during approach + zoom. |
 | Camera feed latency | MEASURED | Video ~0.2 s behind telemetry (SITL). C12 not measured. |
 | Video quality | PENDING | Real camera. |
 
@@ -61,7 +61,7 @@ prints "the link keeps reconnecting -- is ANOTHER target_tracker running?".
 | Left/right response | N/A | Centring is by yaw (`--lateral-mode strafe` untested). |
 | Turning response | PASS | See centering. |
 | Vertical response | N/A (follow) · PASS (GO/ABORT) | Follow holds altitude (`--vz-mode hold`). GO descends to the floor (1.5 m); ABORT climbs +10 m (PASS\*). |
-| Speed limits | PASS | Follow max \|vx\| 0.58 m/s, \|yaw\| 0.34 rad/s within 8 m/s / 1.2 rad/s. GO: ArduPilot `WP_SPD` 15 caps any `--rescue-speed`. |
+| Speed limits | PASS | Follow max \|vx\| 0.58 m/s, \|yaw\| 0.34 rad/s within 8 m/s / 1.2 rad/s. GO: ArduPilot `WP_SPD` 15 caps any `--go-speed`. |
 | Smooth acceleration | PASS | Follow command step p99 0.08 per frame. |
 | Target distance (GO standoff) | PASS\* | GO stops 1 m short: closest 1.07–1.36 m from the box centre. |
 | Target speed changes | PARTIAL | GO re-aims every frame; the opt-in chase held a 4 m/s circling target in 2 of 3 runs. |
@@ -94,7 +94,7 @@ prints "the link keeps reconnecting -- is ANOTHER target_tracker running?".
 | Abort during go-to | PASS\* | Climb-away, see E. |
 | QGC go-to conflict | PENDING | Code cancels on a foreign position target; not tested. |
 | No stale destination | PASS (design) | Re-aimed every frame; holds after 3 s without the target; a new lock cancels the old GO. |
-| Rescue readiness checks | PASS | See Destination validation. |
+| GO readiness checks | PASS | See Destination validation. |
 
 ## G. Reliability and performance
 | Check | Status | Evidence |
@@ -129,4 +129,4 @@ prints "the link keeps reconnecting -- is ANOTHER target_tracker running?".
 - Shadow included in the lock box (borderline IoU).
 - Lock persistence through approach + zoom.
 - People at 6–10 px.
-- Re-run the voided tests with no other tracker connected: `python3 simulation/verify_suite.py mode linkloss vfreeze rescue abortfollow losthover qgc goto --sustained 10`
+- Re-run the voided tests with no other tracker connected: `python3 simulation/verify_suite.py mode linkloss vfreeze GO abortfollow losthover qgc goto --sustained 10`

@@ -18,7 +18,7 @@ if ls ~/sim_run/*/click_*_frame_*.png >/dev/null 2>&1; then python3 tracker/test
 for v in ~/sim_run/recordings/*.avi; do [ -f "$v" ] && { echo "   $v"; python3 tracker/tests/track_bench.py "$v" | tail -1; }; done
 if [ "$SIM" = 1 ]; then
   echo "== 4. simulator scenarios"
-  T="lock reject relock mode linkloss vfreeze rescue abortfollow losthover qgc goto gostop large occlusion people"
+  T="lock reject relock mode linkloss vfreeze GO abortfollow losthover qgc goto gostop large occlusion people"
   if [ "$LONG" = 1 ]; then python3 simulation/verify_suite.py $T --sustained 10; else python3 simulation/verify_suite.py $T; fi
 fi
 echo "== done"

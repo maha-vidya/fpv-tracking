@@ -5,7 +5,7 @@
   python3 sim_events.py mode GUIDED
   python3 sim_events.py wind 5 90              # 5 m/s wind from heading 90 deg (SIM_WIND_SPD / SIM_WIND_DIR)
   python3 sim_events.py wind 0                 # calm
-  python3 sim_events.py rc 9 1900 --seconds 3  # hold RC channel 9 at 1900 us for 3 s (the "rescue" switch), then release
+  python3 sim_events.py rc 9 1900 --seconds 3  # hold RC channel 9 at 1900 us for 3 s (the GO switch), then release
   python3 sim_events.py rc 1 1700 --seconds 2  # a pilot stick deflection on channel 1
   python3 sim_events.py rcseq 9 1500:1.0 1900:1.5   # a 3-position switch: middle (arm) for 1 s, then high (go) for 1.5 s
   python3 sim_events.py param SIM_WIND_TURB 2

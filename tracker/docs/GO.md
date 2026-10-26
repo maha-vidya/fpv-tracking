@@ -1,7 +1,4 @@
-# Running the FPV tracking & dash drone in simulation
-
-> [!NOTE]
-> This project has transitioned to high-speed FPV tracking and dash. Please refer to [FPV_DASH.md](FPV_DASH.md) for the active documentation and runbook.
+# Running the GO drone in simulation
 
 This is the step-by-step runbook for the `tracker/` companion program: bring up Gazebo + ArduPilot SITL,
 run the companion program, lock/follow/go-to-target from the keyboard, stdin, RC, or QGC, and what to
@@ -39,14 +36,14 @@ Wait for `[sim_up] DONE.` (about 30-40s the first time). If anything looks wrong
 
 **Takeoff and altitude are the pilot's job, both in real operation and in this program — `main.cpp`
 contains no takeoff or altitude-control logic at all.** It only ever sends follow velocity commands (once
-`LOCKED`) or the one rescue go-to command, and only after the vehicle is already in GUIDED, which the pilot
+`LOCKED`) or the one GO go-to command, and only after the vehicle is already in GUIDED, which the pilot
 puts it into. Prefer flying takeoff through QGroundControl (step 6 covers connecting it) rather than a
 script, so the test matches real operation:
 
 1. Connect QGC to the simulation (`127.0.0.1:14550`, see step 6) — it should auto-connect once
    `sim_up.sh` is running.
 2. Arm and take off from QGC as you would on the real aircraft, and climb to whatever altitude you want
-   to test at (higher gives better depression-angle geometry for the rescue destination estimate — 10-15m
+   to test at (higher gives better depression-angle geometry for the GO destination estimate — 10-15m
    is a reasonable test altitude).
 3. Leave the vehicle in GUIDED once airborne — that's the mode the companion program requires before it
    will accept a lock.
@@ -88,7 +85,7 @@ python3 ./move_target.py --once 0 15       # one fixed box at (0, 15) -- good fo
 
 ```bash
 cd tracker
-./build/target_tracker --profile sim --enable-rescue --rescue-hover-height 3 --log-dir /tmp/rescue_log
+./build/target_tracker --profile sim --enable-go --go-hover-height 3 --log-dir /tmp/go_log
 ```
 
 With a display available, a window opens (`Follow (click = instant lock, drag+s = precise lock, u =
@@ -102,7 +99,7 @@ text commands instead (one per line, `Enter` to send):
 | `lock X Y W H` | lock a box at pixel (X,Y) size (W,H) — e.g. `lock 290 362 60 70` |
 | `unlock` | release the lock |
 | `go` | **GO now**, one press (needs LOCKED ≥2s and every readiness gate). `--go-confirm`: first press arms, second within 3s confirms |
-| `abort` | abort an ARMED rescue, or cancel+BRAKE an in-flight dash |
+| `abort` | abort an ARMED GO, or cancel+BRAKE an in-flight dash |
 | `quit` | clean shutdown |
 
 Key equivalents when a display is open: `s`=lock (after dragging), `u`/`r`=unlock, `g`=go (press/confirm),
@@ -114,7 +111,7 @@ NED:**
 ```
 lock 290 362 60 70      <- adjust to where the target actually appears; watch for "tracker box rejected"
                            or "LOCKED on a ..." in the log to tell if it took
-go                       <- arms (watch for "RESCUE ARMED")
+go                       <- arms (watch for "GO ARMED")
 go                       <- confirms within 3s (watch for "GO-TO sent: N m diagonal at 5 m/s")
 ```
 
@@ -131,7 +128,7 @@ for n in ('iris_with_gimbal','target_red'):
 "
 ```
 
-The drone should end up hovering **`--rescue-hover-height`** (default 3 m) metres above the target's
+The drone should end up hovering **`--go-hover-height`** (default 3 m) metres above the target's
 altitude, not on top of it.
 
 ### Centring and keeping up with a fast target (follow)
@@ -237,7 +234,7 @@ turns. The speed tiers are given in turn: slow 1.5-4, medium 5-9, fast 11-18 m/s
 OpenVINO):
 
 ```bash
-./build/target_tracker --profile sim-c12cam --enable-rescue --reid
+./build/target_tracker --profile sim-c12cam --enable-go --reid
 ```
 
 Without OpenVINO in the build: start the helper first, `python3 tracker/detector_sidecar.py --reid ~/models/dinov2`, then add
@@ -277,11 +274,11 @@ to `127.0.0.1:14550`, and the companion's camera component listens for QGC's cam
 3. **Tap or draw a rectangle** on the video to lock (same effect as dragging in the local window; latency-
    compensated via `--tap-latency-ms`, default 300 — measure the real value for your setup by comparing
    the on-screen `t=...` timestamp against the wall clock at the moment of a tap, and adjust).
-4. **Rescue control from QGC**: copy `tracker/qgc/RescueActions.json` into QGC's `MavlinkActions` folder
-   (Linux: `~/Documents/QGroundControl/MavlinkActions`) and restart QGC. It adds **Rescue GO**
+4. **GO control from QGC**: copy `tracker/qgc/GoActions.json` into QGC's `MavlinkActions` folder
+   (Linux: `~/Documents/QGroundControl/MavlinkActions`) and restart QGC. It adds **GO**
    (`MAV_CMD_USER_1`: one press = GO; with `--go-confirm` the 1st press arms and shows
-   `ARMED <dist> up/dn<h> ETA<s> h:<height source>`, the 2nd within 3 s confirms), **Rescue ABORT** (`USER_2`), **Track UNLOCK** (`USER_3`) and **BRAKE** (`USER_4`, works
-   even if the rescue isn't armed), all sent to component **191**; the same actions can be mapped to joystick
+   `ARMED <dist> up/dn<h> ETA<s> h:<height source>`, the 2nd within 3 s confirms), **ABORT** (`USER_2`), **Track UNLOCK** (`USER_3`) and **BRAKE** (`USER_4`, works
+   even if the GO isn't armed), all sent to component **191**; the same actions can be mapped to joystick
    buttons. Only commands from `--gcs-sysid` (default 255, QGC's own id) are accepted. The file format is
    QGC's documented `MavlinkActions` format, but it has **not** been clicked through in a real QGC window yet.
 5. Changing mode from QGC's dropdown drops the lock and stops commands (leaving GUIDED always does).
@@ -294,11 +291,11 @@ to `127.0.0.1:14550`, and the companion's camera component listens for QGC's cam
 |---|---|
 | **Lock** | Point the camera at the target (sticks/gimbal), press the **Track LOCK** action (`MAV_CMD_USER_5`): it locks the object at the centre of the image (ground-colour model, else GrabCut; snapped to the one nearest object if the centre misses). Or tap/draw on the video if your QGC build shows the camera-tracking controls. |
 | **Unlock** | **Track UNLOCK** action, or stop tracking in the video widget. |
-| **GO** | **Rescue GO** once: GO at once. With `--go-confirm`, twice: the first press arms and shows `ARMED <dist> up/dn<h> ETA<s> h:<height>` *and* a **`DEST ?`** marker on the map; the second press (within 3 s) confirms. |
-| **Abort / panic** | **Rescue ABORT**, or **BRAKE**. |
+| **GO** | **GO** once: GO at once. With `--go-confirm`, twice: the first press arms and shows `ARMED <dist> up/dn<h> ETA<s> h:<height>` *and* a **`DEST ?`** marker on the map; the second press (within 3 s) confirms. |
+| **Abort / panic** | **ABORT**, or **BRAKE**. |
 | **See the target** | The map shows a **`TARGET`** icon at the estimated ground position (with its heading and speed once moving), relabelled `TGT ?` while coasting, `TGT LOST` / `TGT OFF` after a loss/unlock, and a **`DEST`** icon for an active dash. |
 
-Put `tracker/qgc/RescueActions.json` in QGC's `MavlinkActions` folder (Linux:
+Put `tracker/qgc/GoActions.json` in QGC's `MavlinkActions` folder (Linux:
 `~/Documents/QGroundControl/MavlinkActions`), restart QGC, and pick it as the Fly View custom-actions file;
 the same actions can be bound to joystick/gamepad buttons for one-press use.
 
@@ -323,12 +320,12 @@ A carefully drawn rectangle is tightened by GrabCut.
 
 ```bash
 cd tracker
-./build/target_tracker --profile sim --enable-rescue \
-    --rc-centerlock-channel 6 --rc-rescue-channel 7
+./build/target_tracker --profile sim --enable-go \
+    --rc-centerlock-channel 6 --rc-go-channel 7
 ```
 
 Drive channel values from another terminal with `simulation/sim_events.py` (check its `--help`; it sets RC
-override values via MAVLink). The rescue channel is read as a **3-position switch**: low = idle/abort,
+override values via MAVLink). The GO channel is read as a **3-position switch**: low = idle/abort,
 any move up (low→mid or →high) = **GO**; back to low during a dash = stop (BRAKE). With `--go-confirm`: low→mid = arm,
 mid→high = confirm, so a 2-position switch cannot complete it.
 
@@ -342,10 +339,10 @@ cd simulation
 
 ## Troubleshooting
 
-- **`g` does nothing.** Nine times out of ten this is `--enable-rescue` missing from the launch command —
-  without it the whole rescue module is off and `g`/`go` is silently inert. As of this fix it now says so
-  explicitly (`'g' has no effect: rescue is disabled...`) instead of staying silent. If rescue *is* enabled
-  and `g` still seems to do nothing, check the console/log for `RESCUE IDLE (not ready: ...)` — it now
+- **`g` does nothing.** Nine times out of ten this is `--enable-go` missing from the launch command —
+  without it the whole GO module is off and `g`/`go` is silently inert. As of this fix it now says so
+  explicitly (`'g' has no effect: GO is disabled...`) instead of staying silent. If GO *is* enabled
+  and `g` still seems to do nothing, check the console/log for `GO IDLE (not ready: ...)` — it now
   names the specific blocking condition (not locked, not GUIDED, no GPS, no destination estimate yet, etc.)
   instead of just "not ready".
 - **Tracker keeps losing fast-moving or crossing targets.** Not a ByteTrack/BoT-SORT situation — those are
@@ -486,7 +483,7 @@ After arrival the target is under the camera and usually lost. The drone then ho
 
 ### Fast GO and ABORT
 
-**How GO flies.** Velocity commands straight at the end point at `--rescue-speed`. Braking is computed from the drone's actual
+**How GO flies.** Velocity commands straight at the end point at `--go-speed`. Braking is computed from the drone's actual
 distance, allowing ~0.5 s for the autopilot to respond. Two earlier designs were measured and dropped:
 - A destination re-sent every frame made ArduPilot re-plan from near rest each time: ~1 m/s average on a "5–10 m/s" GO.
 - A moving position+velocity setpoint: ArduPilot trailed it by ~1.5 s, so the drone surged and stalled, and overshot into the
@@ -515,11 +512,11 @@ Measured with 8 m/s GO, 15 m line from 12 m up:
 - velocity commands: top 7.4 m/s, arrival in 8.6 s.
 - velocity commands + tilt/jerk: top 6.8 m/s, arrival in **7.2 s**.
 
-**ABORT** (window button, `x`, QGC "Rescue ABORT", stdin `abort`) **leaves the target and climbs**: whatever the drone is doing
+**ABORT** (window button, `x`, QGC "ABORT", stdin `abort`) **leaves the target and climbs**: whatever the drone is doing
 (a GO dash, following, or holding after a GO), the GO and the follow loop stop at once. The drone climbs straight up
 `--abort-climb` metres (default 10, never above `--alt-ceiling`) from where it is and holds there in GUIDED. The banner reads
 "ABORTED - CLIMBING AWAY FROM THE TARGET". Nothing re-engages without a new LOCK/GO; the pilot takes over with a mode switch.
-QGC's separate "BRAKE" action still brakes in place. The RC rescue switch going back to low keeps its old meaning.
+QGC's separate "BRAKE" action still brakes in place. The RC GO switch going back to low keeps its old meaning.
 
 Measured, ABORT from QGC 2.5 s into an 8 m/s GO at 6.2 m:
 - It sank 2.3 m more while braking the descent, then climbed to 16.4 m and held in GUIDED.
@@ -529,7 +526,7 @@ Measured, ABORT from QGC 2.5 s into an 8 m/s GO at 6.2 m:
 silent and the drone holds a position target right where it is, in GUIDED. Measured: within 6 cm for 8 s. A new lock releases
 the hold. `--lost-loiter` restores the old hand-back to LOITER.
 
-**QGC.** `tracker/qgc/RescueActions.json` must be in `~/Documents/QGroundControl/MavlinkActions/` (also copied to
+**QGC.** `tracker/qgc/GoActions.json` must be in `~/Documents/QGroundControl/MavlinkActions/` (also copied to
 `CustomActions/` for older QGC versions), and selected in QGC's settings (Fly View → MAVLink Actions). Tested with QGC's own ids
 (system 255) through ArduPilot:
 - LOCK / GO / ABORT / UNLOCK / BRAKE: all acknowledged and acted on.
@@ -574,7 +571,7 @@ The defaults are in one place: the `GO SETTINGS -- EDIT HERE` block at the top o
 `-10` = fly over it and stop 10 m past it (in the direction GO started flying; the nose then points at the stop point, so it does
 not spin round over the target). A fixed FPV camera loses the target once the drone is over it, so a past-the-target GO finishes
 on the target's last track (a standing target) or holds after 3 s (a moving one).
-- Per launch: `--rescue-speed S --go-offset M --goto-accel A`.
+- Per launch: `--go-speed S --go-offset M --goto-accel A`.
 - Per GO: stdin `go SPEED OFFSET` (e.g. `go 15 -10`; 0 = configured), or QGC GO with param1 = speed, param2 = offset.
 - The actions file has "GO 5 m/s, stop 3 m short" and "GO fast 8 m/s, at target" as editable examples.
 - `on_go_arrived()` in main.cpp is called once on arrival and is deliberately empty: the operator's landing goes there.
@@ -599,8 +596,8 @@ on the target's last track (a standing target) or holds after 3 s (a moving one)
 - **Real hardware**: the C12's gimbal-angle reference frame (body vs earth; this is exactly `--camera-mount`),
   what it does on target loss, and the C12 thermal stream URL all still need a bench check before trusting
   them on a real aircraft. Bench-test the MAVLink link and RC failsafes with props off.
-- **New, opt-in, simulator-tested only by unit tests so far**: `--follow-ff`, `--rescue-lead`,
-  `--rescue-stay-over`, `--lock-without-guided`. Tune `--follow-ff` and the follow gains (still the
+- **New, opt-in, simulator-tested only by unit tests so far**: `--follow-ff`, `--go-lead`,
+  `--go-stay-over`, `--lock-without-guided`. Tune `--follow-ff` and the follow gains (still the
   untuned starting values) in `scenario_runner.py` before relying on them.
 - **Not implemented** (decisions needed, not silently dropped): automatic re-acquisition after LOST (it
   conflicts with the hand-back-to-LOITER posture), MAVLink2 signing (needs keys provisioned on the FC and

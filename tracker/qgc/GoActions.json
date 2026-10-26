@@ -10,7 +10,7 @@
         },
         {
             "label": "GO (default)",
-            "description": "ONE press: GO now (with --go-confirm: 1st press arms and shows distance/ETA, 2nd within 3 s confirms). Uses the tracker's --rescue-speed and --go-offset (default: to the target)",
+            "description": "ONE press: GO now (with --go-confirm: 1st press arms and shows distance/ETA, 2nd within 3 s confirms). Uses the tracker's --go-speed and --go-offset (default: to the target)",
             "mavCmd": 31010,
             "compId": 191
         },

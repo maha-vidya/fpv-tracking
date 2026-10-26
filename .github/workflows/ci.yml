@@ -25,7 +25,7 @@ jobs:
           cmake -S tracker -B tracker/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-Werror
           cmake --build tracker/build -j"$(nproc)"
 
-      - name: Self-test (follow logic, rescue, geometry, protocol)
+      - name: Self-test (follow logic, GO, geometry, protocol)
         run: tracker/build/target_tracker --selftest
 
       - name: Sidecar syntax check
