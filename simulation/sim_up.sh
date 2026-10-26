@@ -177,6 +177,9 @@ start relay gst-launch-1.0 -q udpsrc port="${CAM_UDP_PORT:-5600}" caps="applicat
 # 5b. enable the camera stream once
 sleep 1
 gz topic -t "${CAM_TOPIC}/enable_streaming" -m gz.msgs.Boolean -p 'data: 1' >/dev/null 2>&1 && echo "[sim_up] camera streaming enabled (once)"
+# ... and again 3x over the next 6 s, in the background: sent once, it was sometimes lost (camera not ready yet) and the tracker then got
+# no video at all ("[VIDEO ERROR] no frame received", 2026-10-24). Enabling an already streaming camera changes nothing.
+( for i in 1 2 3; do sleep 2; gz topic -t "${CAM_TOPIC}/enable_streaming" -m gz.msgs.Boolean -p 'data: 1' >/dev/null 2>&1; done ) &
 
 # 6. target boxes
 case "$TARGET" in
